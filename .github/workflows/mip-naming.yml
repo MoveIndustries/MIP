@@ -1,0 +1,71 @@
+name: MIP Naming Convention
+
+on:
+  pull_request:
+    paths:
+      - 'mips/**'
+
+jobs:
+  check-naming:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check MIP file naming convention
+        run: |
+          # Pattern: mip-<NNN>-<slug>.md  or  mip-xxx-<slug>.md (drafts)
+          # <NNN> = zero-padded 3-digit number, <slug> = kebab-case lowercase
+          PATTERN='^mips/mip-(([0-9]{3})|xxx)-[a-z0-9]+(-[a-z0-9]+)*\.md$'
+
+          bad_files=()
+          for file in $(git diff --name-only --diff-filter=AR "${{ github.event.pull_request.base.sha }}" HEAD -- 'mips/'); do
+            # Only enforce naming on top-level .md files in mips/ (skip assets under mips/diagrams/**)
+            [[ "$file" != *.md ]] && continue
+            [[ "$file" == mips/diagrams/* ]] && continue
+
+            if ! echo "$file" | grep -qE "$PATTERN"; then
+              bad_files+=("$file")
+            fi
+          done
+
+          if [ ${#bad_files[@]} -gt 0 ]; then
+            echo "::error::The following MIP files do not follow the naming convention:"
+            echo ""
+            for f in "${bad_files[@]}"; do
+              echo "  - $f"
+            done
+            echo ""
+            echo "  Expected: mip-<NNN>-<slug>.md  (e.g., mip-001-proposer-selection.md)"
+            echo "  Drafts:   mip-xxx-<slug>.md    (e.g., mip-xxx-my-proposal.md)"
+            echo ""
+            echo "  <NNN> = zero-padded 3-digit number"
+            echo "  <slug> = short kebab-case summary (lowercase letters, digits, hyphens)"
+            echo ""
+            exit 1
+          fi
+
+          echo "All MIP files follow the naming convention."
+
+      - name: Check for duplicate MIP numbers
+        run: |
+          # Extract MIP numbers from all .md files, excluding "xxx" drafts
+          dupes=$(ls mips/mip-*.md 2>/dev/null \
+            | sed -n 's|^mips/mip-\([0-9]\{3\}\)-.*\.md$|\1|p' \
+            | sort \
+            | uniq -d)
+
+          if [ -n "$dupes" ]; then
+            echo "::error::Duplicate MIP numbers found:"
+            echo ""
+            for num in $dupes; do
+              echo "  MIP-$num:"
+              ls mips/mip-${num}-*.md | sed 's/^/    /'
+            done
+            echo ""
+            echo "Each MIP number must be unique. Please resolve the duplicates."
+            exit 1
+          fi
+
+          echo "No duplicate MIP numbers found."
