@@ -33,7 +33,7 @@ In scope: the wallet ↔ dApp interface, the wallet-side custody and proof-const
 
 - Decryption-key rotation UI in conforming wallets. The protocol's `rotate_encryption_key` remains available through `@moveindustries/confidential-assets` for technical users; wallets expose no `ca_rotateEncryptionKey` method. Rotation in place addresses `dk`-only compromise. Mnemonic / device / pepper compromise is recovered by moving funds to a fresh account, not by in-place rotation.
 - Defining a chain-level or per-asset auditor registry beyond consuming the existing `get_chain_auditor()` / `get_asset_auditor(token)` views.
-- Threshold-ElGamal or MPC-based multi-owner custody. Considered in Alternative Solutions and rejected for v1 against the current on-chain verifier.
+- Threshold-ElGamal or MPC-based multi-owner custody. Considered in Alternative Solutions and rejected against the current on-chain verifier.
 - Server-side coordinator services that hold `dk` on behalf of the user. Considered and rejected; violates the wallet-custody principle.
 - New cryptographic primitives in the protocol. This MIP composes existing primitives (Twisted ElGamal, Bulletproofs, Sigma protocols) under a new wallet/dApp interface and adds one minimal Move module (`dk_inbox`) for envelope-addressed event delivery.
 
@@ -47,7 +47,7 @@ Multisig accounts hold funds but have no private key, so a single owner ("the pr
 
 ## Impact
 
-**Audiences and required actions.**
+**Audiences and required actions:**
 
 - **Wallet implementers (Motion Wallet, third-party Movement wallets).** Implement the `ca_*` namespace, the canonical derivation policies for every backing they support, the keystore-and-loader invariants, the multisig-entry data model, the explicit "Accept incoming funds" authorization for rollover, and the `dk_inbox` share/import flows. Wallets that do not support CA advertise the absence through wallet-standard feature detection; dApps degrade gracefully.
 - **dApp developers.** Use `ca_*` RPCs via `@moveindustries/wallet-adapter-react` for every CA operation, including multisig. Stop bundling `@moveindustries/confidential-assets` or any derivative proof-construction code into page JavaScript. Treat `actual` and `pending` as distinct balances and prompt users to accept pending funds explicitly before retrying a spend on `INSUFFICIENT_BALANCE`. Conformance rules A1–A6 in [Specification and Implementation Details](#specification-and-implementation-details) are normative for any dApp claiming CA support.
@@ -56,13 +56,11 @@ Multisig accounts hold funds but have no private key, so a single owner ("the pr
 - **Asset issuers and chain governance.** No required action for this MIP — but note that the wallet refuses to construct a confidential transfer if `get_chain_auditor()` returns `None`. Configuring a chain-level auditor is therefore a deployment prerequisite for end-to-end confidential transfers.
 - **End users.** Visible behavior change for receive-only or pending-heavy accounts: incoming confidential transfers accumulate as a labeled "pending — accept incoming funds" line that the user explicitly authorizes before it becomes spendable. The wallet never bundles rollover into a spend.
 
-**If we do not accept this proposal.** Each wallet builds its own derivation policy and its own request surface; minor divergence (a different `tokenIndex` formula, a different message prefix, a different HKDF info layout) silently orphans on-chain registrations across wallets and breaks cross-device recovery. dApps re-implement CA in page JavaScript, which exposes `dk` material to any compromised origin and forecloses any pretense of confidentiality. Multisig + CA becomes ad hoc per-team, with no standard delivery channel for shared `dk` material.
-
 **Dependencies.** None on prior MIPs. This MIP is the first MIP that touches the wallet ↔ dApp interface for CA. The `dk_inbox` Move module is small enough to ship in the same framework release that adopts this MIP.
 
 ## Alternative Solutions
 
-Four constructions for multi-owner / sharing of `dk` material were considered. The matrix below is the central comparison for this MIP's most consequential design choice. The chosen construction is row 1.
+The most consequential design choice in this MIP is how multisig accounts participate in confidential assets — specifically, how the `dk[multisig, token]` needed to decrypt balances and construct proofs is custodied across co-owners. Four constructions were considered. The matrix below compares them; the chosen construction is shared-`dk` with on-chain `dk_inbox` delivery (the first row).
 
 | Approach | Material per owner | Proof construction | Privacy under one-owner wallet compromise | Funds under one-owner wallet compromise | Viable against the current protocol |
 |---|---|---|---|---|---|
@@ -71,7 +69,7 @@ Four constructions for multi-owner / sharing of `dk` material were considered. T
 | Threshold ElGamal with threshold ZK (true MPC) | A share of `dk`; no single owner can decrypt | k owners run interactive MPC to jointly decrypt and construct a single proof | Preserved — attacker holds one share, below threshold | Safe | No — requires a threshold-ElGamal-aware Move verifier, threshold-friendly Bulletproofs/Sigma, and an MPC channel between wallets. Substantial protocol and wallet work |
 | Trusted-coordinator service (server holds `dk`; owners authenticate to it) | The owner's own Ed25519 key; an auth token | Coordinator constructs proofs on owners' behalf | Lost on coordinator compromise — SPOF outside the wallet trust boundary | Safe — k-of-n approvals still required on chain | Possible to build, but rejected. Violates Principle 1: `dk` is wallet-custodied. Disclosure to a shared service outside the user's control is excluded by design |
 
-Row 1 is the only construction that is (a) viable against the current on-chain verifier with no protocol changes beyond a small new Move module that does no curve work, (b) consistent with the wallet-custody principle, and (c) shippable in a single coordinated release across wallet + SDK + framework. The retroactive-disclosure cost of using public chain calldata for delivery — if a recipient's owner key is later compromised, every envelope ever addressed to them on chain is decryptable from history — is documented in [Security Considerations](#security-considerations) and mitigated by `rotate_encryption_key` and (longer term) a post-quantum KEM migration via the envelope version tag.
+Shared-`dk` with on-chain `dk_inbox` delivery is the only construction that is (a) viable against the current on-chain verifier with no protocol changes beyond a small new Move module that does no curve work, (b) consistent with the wallet-custody principle, and (c) shippable in a single coordinated release across wallet + SDK + framework. The retroactive-disclosure cost of using public chain calldata for delivery — if a recipient's owner key is later compromised, every envelope ever addressed to them on chain is decryptable from history — is documented in [Security Considerations](#security-considerations) and mitigated by `rotate_encryption_key` and (longer term) a post-quantum KEM migration via the envelope version tag.
 
 Two further alternatives were rejected at the operation level:
 
@@ -112,7 +110,7 @@ tokenIndex = u32_le(SHA-256(tokenMetadataAddress)[0..4]) & 0x7FFFFFFF
 
 `dk[token] = TwistedEd25519PrivateKey.fromDerivationPath(path, mnemonic)`.
 
-**Hardware backings (device signature).**
+**Hardware backings (device signature):**
 
 ```
 message[token] = decryptionKeyDerivationMessage ‖ ":" ‖ hex(tokenMetadataAddress)
@@ -167,17 +165,58 @@ Motion Wallet's concrete schema is one `chrome.storage.local` entry per `(wallet
 
 The default `mode: "submit"` flow is described per operation. For multisig CA operations the dApp passes `sender = <multisigAddress>` and `mode: "buildOnly"`; the wallet stops at proof construction and returns BCS-encoded `EntryFunction` bytes instead of submitting (see [Multisig accounts](#multisig-accounts)).
 
-**Register.** dApp calls `ca_register({ token })`. The wallet derives `dk[token]`, computes `ek[token] = dk[token].publicKey()`, persists the keystore entry (or confirms an existing one), constructs the Schnorr ZKPoK registration proof, builds and signs the `register(sender, token, ek, commitment, response)` transaction, presents it for user confirmation, and submits after confirmation. Re-registering the same `(account, token)` pair must reuse the existing `dk[token]`; the wallet does not silently rotate it.
+#### Register
 
-**Deposit.** dApp calls `ca_deposit({ token, amount })`. The wallet routes to a single on-chain entrypoint based on registration and normalization state: `register_and_deposit_and_rollover_pending_balance` (not registered), `deposit_and_rollover_pending_balance` (registered, normalized), or `deposit_and_normalize_and_rollover_pending_balance` (registered, not normalized). Every route results in **one** on-chain transaction with one user approval. The not-registered route derives `dk[token]` to produce `ek[token]` for the embedded register call.
+- dApp calls `ca_register({ token })`.
+- The wallet derives `dk[token]` and computes `ek[token] = dk[token].publicKey()`.
+- The wallet persists the keystore entry, or confirms an existing one for this `(account, token)` pair.
+- The wallet constructs the Schnorr ZKPoK registration proof, then builds and signs the `register(sender, token, ek, commitment, response)` transaction.
+- The wallet presents the transaction for user confirmation and submits after confirmation.
+- Re-registering the same `(account, token)` pair must reuse the existing `dk[token]`; the wallet does not silently rotate it.
 
-**Withdraw.** dApp calls `ca_withdraw({ token, amount })`. The wallet decrypts the actual balance with `dk[token]`. If `actual < amount` it returns `INSUFFICIENT_BALANCE` and **does not** auto-rollover pending funds. It builds the sigma proof and range proof for the new balance, presents one transaction for user confirmation, and submits after confirmation.
+#### Deposit
 
-**Confidential transfer.** dApp calls `ca_transfer({ token, recipient, amount, auditorAddresses?, senderAuditorHint? })`. The wallet decrypts the actual balance, returns `INSUFFICIENT_BALANCE` if `actual < amount`, fetches the recipient's `ek[token]` from chain, fetches the chain-level auditor `ek` via `get_chain_auditor()` (mandatory inclusion) and the per-asset auditor via `get_asset_auditor(token)` (when configured), combines them with any per-transfer auditors from the request, builds the `ConfidentialTransfer` payload (sigma + two range proofs), presents one transaction for user confirmation, and submits after confirmation. `senderAuditorHint`, when supplied, is bound into the sigma Fiat–Shamir transcript via the same `bcs::to_bytes(sender_auditor_hint)` encoding the on-chain verifier uses; the wallet enforces the on-chain length cap from `max_sender_auditor_hint_bytes()`.
+- dApp calls `ca_deposit({ token, amount })`.
+- The wallet routes to a single on-chain entrypoint based on registration and normalization state:
+  - `register_and_deposit_and_rollover_pending_balance` — not registered.
+  - `deposit_and_rollover_pending_balance` — registered, normalized.
+  - `deposit_and_normalize_and_rollover_pending_balance` — registered, not normalized.
+- The not-registered route derives `dk[token]` to produce `ek[token]` for the embedded register call.
+- Every route results in **one** on-chain transaction with one user approval.
 
-**Rollover and normalization.** dApp calls `ca_rolloverPending({ token })` to express the user's intent to accept pending funds. The wallet computes whether `normalize` is required and chains it within a single user-confirmation step (silent, because normalization is a protocol detail of "accept incoming funds"). At most two on-chain transactions are submitted (`normalize` then `rollover`); the final `rollover` hash is returned. The wallet **never** initiates rollover or normalization on a timer, on balance fetch, on inbound transfer, or in response to any dApp signal. When `pending > 0` the wallet surfaces a distinct "Accept incoming funds" action; `ca_withdraw` / `ca_transfer` never bundle rollover.
+#### Withdraw
 
-**Key rotation.** Not wallet-supported. Motion Wallet exposes no UI for rotation and no `ca_rotateEncryptionKey` method. A technical user requiring same-account rotation uses `@moveindustries/confidential-assets` (`ConfidentialAsset` / `ConfidentialAssetTransactionBuilder.rotateEncryptionKey`) directly. Rotation in place addresses only `dk`-only compromise; mnemonic / device / pepper compromise is recovered by moving funds to a fresh account.
+- dApp calls `ca_withdraw({ token, amount })`.
+- The wallet decrypts the actual balance with `dk[token]`.
+- If `actual < amount`, the wallet returns `INSUFFICIENT_BALANCE` and **does not** auto-rollover pending funds.
+- Otherwise the wallet builds the sigma proof and range proof for the new balance.
+- The wallet presents one transaction for user confirmation and submits after confirmation.
+
+#### Confidential transfer
+
+- dApp calls `ca_transfer({ token, recipient, amount, auditorAddresses?, senderAuditorHint? })`.
+- The wallet decrypts the actual balance; returns `INSUFFICIENT_BALANCE` if `actual < amount`.
+- The wallet fetches the recipient's `ek[token]` from chain.
+- The wallet fetches the chain-level auditor `ek` via `get_chain_auditor()` (mandatory inclusion) and the per-asset auditor via `get_asset_auditor(token)` (when configured).
+- The wallet combines those with any per-transfer auditors from the request and builds the `ConfidentialTransfer` payload (sigma + two range proofs).
+- The wallet presents one transaction for user confirmation and submits after confirmation.
+- `senderAuditorHint`, when supplied, is bound into the sigma Fiat–Shamir transcript via the same `bcs::to_bytes(sender_auditor_hint)` encoding the on-chain verifier uses. The wallet enforces the on-chain length cap from `max_sender_auditor_hint_bytes()`.
+
+#### Rollover and normalization
+
+- dApp calls `ca_rolloverPending({ token })` to express the user's intent to accept pending funds.
+- The wallet computes whether `normalize` is required and chains it within a single user-confirmation step. Normalization is silent here because it is a protocol detail of "accept incoming funds."
+- At most two on-chain transactions are submitted (`normalize` then `rollover`); the final `rollover` hash is returned.
+- The wallet **never** initiates rollover or normalization on a timer, on balance fetch, on inbound transfer, or in response to any dApp signal.
+- When `pending > 0` the wallet displays a distinct "Accept incoming funds" action.
+- `ca_withdraw` and `ca_transfer` never bundle rollover.
+
+#### Key rotation
+
+- Not wallet-supported.
+- Motion Wallet exposes no UI for rotation and no `ca_rotateEncryptionKey` method.
+- A technical user requiring same-account rotation uses `@moveindustries/confidential-assets` (`ConfidentialAsset` / `ConfidentialAssetTransactionBuilder.rotateEncryptionKey`) directly.
+- Rotation in place addresses only `dk`-only compromise; mnemonic / device / pepper compromise is recovered by moving funds to a fresh account.
 
 ### Wallet UX decisions
 
@@ -231,7 +270,7 @@ type WalletEntry =
 
 A multisig entry is a **view-only reference**, not a switchable signing account: there is no private key, and the dApp-visible connected account always remains the user's Ed25519 wallet. Selecting a multisig entry opens its dk-management surface (derive / import / export per token, view balances); it does **not** change `getAccount()` for dApps, because every fund-moving call — propose, approve, execute — is signed by the owner's Ed25519 key against `0x1::multisig_account::*` with the multisig address as a function argument. The wallet identifies the target multisig for `ca_*` `buildOnly` calls by matching the dApp-supplied `sender` parameter against `address` on a multisig entry; the entry does not need to be "active."
 
-**Data ownership.**
+**Data ownership:**
 
 | Held by | Material | Used for |
 |---|---|---|
@@ -242,7 +281,7 @@ A multisig entry is a **view-only reference**, not a switchable signing account:
 | On chain (public) | Multisig's per-token `ek[token]` | Lets senders encrypt confidential transfers to this multisig |
 | On chain (public, encrypted) | Multisig's confidential balances under `ek` | Source of truth for confidential balances |
 
-**Proposer-side derivation.**
+**Proposer-side derivation:**
 
 - **Software:** `dk[multisig, token] = fromDerivationPath("m/44'/637'/{multisigAccountIndex}'/1'/{tokenIndex}'", mnemonic)`, where `multisigAccountIndex = u32_le(SHA-256(multisigAddress)[0..4]) & 0x7FFFFFFF`. Collision probability with personal accounts is ~1/2³¹; on collision the proposer must rotate.
 - **Hardware:** `message = decryptionKeyDerivationMessage ‖ ":" ‖ hex(multisigAddress) ‖ ":" ‖ hex(tokenMetadataAddress)`, then `fromSignature(device.sign(message))`. Single-owner hardware layout is unchanged.
@@ -325,9 +364,9 @@ module aptos_experimental::dk_inbox {
 }
 ```
 
-No curve operations, no proof verification, no resource state. Validates sender/recipient ownership, parallel non-empty vectors, and a per-envelope size ceiling. Emits one event per recipient.
+The module performs no curve operations, no proof verification, and holds no resource state. It validates that the sender and every recipient are owners of the referenced multisig, that the `recipients` and `envelopes` vectors are parallel and non-empty, and that each envelope is below the per-envelope size ceiling. It then emits one event per recipient.
 
-**Envelope format (v1).** Each envelope is an authenticated X25519 + AES-GCM ciphertext bound to a single `(multisig, token, sender, recipient)` tuple:
+**Envelope format.** Each envelope is an authenticated X25519 + AES-GCM ciphertext bound to a single `(multisig, token, sender, recipient)` tuple:
 
 ```
 envelope_v1 :=
@@ -347,7 +386,7 @@ Recipient X25519 pubkey is the standard birational map of their on-chain Ed25519
 
 **Initial share flow.** One designated owner derives `dk[multisig, token]`, registers `ek[multisig, token]` via a multisig proposal, then submits one `dk_inbox::share_dk` call carrying `recipients` and `envelopes` vectors for every co-owner. Single user confirmation, single Ed25519 signature, single gas payment. An owner who has never transacted (no on-chain Ed25519 pubkey) is omitted from the share and re-shared later via a length-1 `recipients` vector.
 
-**Owner additions and removals.**
+**Owner additions and removals:**
 
 - **Owner added.** The dk-management surface diffs the on-chain owner set against `DkShared` recipients per token. Missing recipients appear as "Share <TOKEN> dk with new owner 0xefgh…" actions, each gated by explicit confirmation surfacing the new owner's address.
 - **Owner removed.** A removed owner retains the `dk` bytes locally — the chain cannot reach into their wallet — and retains decryption capability for past and future ciphertexts under that `ek`. Funds remain safe (k-of-n approvals still required). Remaining owners rotate `ek` per affected token via the SDK's `rotate_encryption_key` and re-share. The wallet detects the change on chain and surfaces a banner listing tokens needing rotation.
@@ -360,7 +399,7 @@ The wallet must warn before proposing removal of the last current holder of a to
 
 ### Auditor support
 
-**Three kinds of auditors compose on a single transfer.**
+**Three kinds of auditors compose on a single transfer:**
 
 1. **Global (chain-level) auditor.** Configured at chain level via `set_chain_auditor`; applies to every confidential transfer with no exceptions. Read via `get_chain_auditor()` (and `get_chain_auditor_epoch()` for staleness checks). The wallet **must** include it in every confidential transfer and **must refuse** to construct a transfer when none is configured.
 2. **Per-asset auditor.** Optional; configured per fungible asset by the asset issuer via `set_asset_auditor`. Read via `get_asset_auditor(token)` (and `get_asset_auditor_epoch(token)`). The wallet must include it in transfers of the affected asset when configured.
@@ -376,7 +415,7 @@ The wallet must warn before proposing removal of the last current holder of a to
 
 The `ca_*` methods are the dApp ↔ wallet RPC surface. They are not exports of the TypeScript SDK; wallet support for each is implementation-defined and advertised via wallet-standard features (below).
 
-**Read methods.**
+**Read methods:**
 
 | Method | Request | Response | Notes |
 |---|---|---|---|
@@ -386,7 +425,7 @@ The `ca_*` methods are the dApp ↔ wallet RPC surface. They are not exports of 
 | `ca_getGlobalAuditor` | `{}` | `{ auditorEncryptionKey?: string, epoch: number }` | Chain-level. `auditorEncryptionKey` omitted if unconfigured (wallet then refuses to construct transfers). |
 | `ca_getAuditor` | `{ token }` | `{ auditorEncryptionKey?: string, epoch: number }` | Per-asset. Omitted if unconfigured for that token. |
 
-**Write methods.**
+**Write methods:**
 
 | Method | Request | Response | Notes |
 |---|---|---|---|
@@ -453,7 +492,7 @@ features: {
 }
 ```
 
-No version suffix in v1. A future incompatible change will adopt whatever versioning convention the wallet-standard has adopted by then (e.g. a `:v2` suffix), with co-publication during a deprecation window.
+No version suffix on the feature key. A future incompatible change will adopt whatever versioning convention the wallet-standard has adopted by then (for example a `:v2` suffix), with co-publication during a deprecation window.
 
 #### SDK changes required by this design
 
@@ -520,13 +559,13 @@ The testing plan is split across three layers, matching where the invariants liv
 
 ## Risks and Drawbacks
 
-**Backward compatibility.**
+**Backward compatibility:**
 
 - The `ca_*` namespace is additive. Wallets without CA support are unaffected; dApps without CA support are unaffected.
 - The required removal (or restriction) of `withdrawWithTotalBalance` / `transferWithTotalBalance` is a breaking change to direct SDK callers. Callers should be migrated to `getBalance` + `withdraw` / `transfer`. The breaking change is intentional and is the only way to restore the explicit-authorization invariant; a soft-deprecation period in the SDK is feasible.
-- The canonical derivation policies (software path, hardware message, keyless HKDF) are pinned forever from v1 of any conforming wallet. A future v2 policy (e.g. a different HKDF salt) would orphan every v1 registration; rotation in place is the only migration, and the SDK's `rotate_encryption_key` is the tool. The keyless HKDF salt `movement-ca/v1` reserves room for that future migration.
+- The canonical derivation policies (software path, hardware message, keyless HKDF) are pinned forever from the first conforming release. A future policy change (for example a different HKDF salt) would orphan every existing registration; rotation in place is the only migration, and the SDK's `rotate_encryption_key` is the tool. The keyless HKDF salt `movement-ca/v1` carries an embedded version tag that reserves room for that future migration.
 
-**Risks.**
+**Risks:**
 
 | Risk | Mitigation |
 |---|---|
@@ -556,8 +595,8 @@ The testing plan is split across three layers, matching where the invariants liv
 
 ## Future Potential
 
-- **Threshold ElGamal multi-owner custody.** A future protocol change that adds a threshold-ElGamal-aware Move verifier and threshold-friendly Bulletproofs/Sigma protocols would let k owners jointly hold a share of `dk` and produce one proof through MPC. Privacy would survive any single-owner wallet compromise. This MIP's shared-`dk` design is the v1 construction that is shippable today; threshold custody is the natural v2.
-- **Post-quantum envelope.** The envelope version tag `mv-dk-enc-v1` exists so a `mv-dk-enc-v2` can be introduced under a post-quantum KEM when one is ecosystem-ready, closing the retroactive-decryption tail of the on-chain delivery channel.
+- **Threshold ElGamal multi-owner custody.** A future protocol change that adds a threshold-ElGamal-aware Move verifier and threshold-friendly Bulletproofs/Sigma protocols would let k owners jointly hold a share of `dk` and produce one proof through MPC. Privacy would survive any single-owner wallet compromise. This MIP's shared-`dk` design is the construction that is shippable today; threshold custody is a natural follow-on.
+- **Post-quantum envelope.** The envelope's embedded version tag `mv-dk-enc-v1` exists so a successor envelope format can be introduced under a post-quantum KEM when one is ecosystem-ready, closing the retroactive-decryption tail of the on-chain delivery channel.
 - **Auditor registries.** The MIP consumes `get_chain_auditor()` and `get_asset_auditor(token)` views and surfaces them to the user. A future MIP could define richer governance, rotation, and discovery for auditor keys — and a per-account auditor list — without touching this MIP's wallet ↔ dApp interface.
 - **Wallet-standard `movement:*` migration.** Today this MIP advertises CA support under both `aptos:confidentialAssets` and `movement:confidentialAssets`. A future ecosystem-coordinated release should drop the `aptos:*` aliases across the entire wallet-standard feature surface; this MIP just adopts the existing dual-publish convention rather than moving ahead of it.
 - **In five years.** Movement has a stable, multi-wallet `ca_*` ecosystem in which confidential assets are the default for transfers above some user-configurable threshold, the per-asset auditor surface is widely adopted by regulated issuers, and multisig + CA is in mainstream treasury use without bespoke per-team tooling.
@@ -575,8 +614,8 @@ The testing plan is split across three layers, matching where the invariants liv
 
 - **SDK (`@moveindustries/confidential-assets`, `@moveindustries/ts-sdk`):** Phase 1.
 - **Wallet adapter (`@moveindustries/wallet-adapter-react`):** Concurrent with Phase 1; adapter is a thin wrapper and only needs the dual-publish feature key and the `useConfidentialAssets` hook.
-- **CLI:** None planned for v1. The CLI is not a wallet trust boundary; users who need scripted CA operations use the SDK directly in a trusted environment.
-- **Indexer:** Existing GraphQL `events` query is sufficient for `dk_inbox` discovery. A dedicated indexed table for `DkShared` is not required for v1; a future indexer enhancement could provide it for very large multisigs.
+- **CLI:** None planned. The CLI is not a wallet trust boundary; users who need scripted CA operations use the SDK directly in a trusted environment.
+- **Indexer:** Existing GraphQL `events` query is sufficient for `dk_inbox` discovery. A dedicated indexed table for `DkShared` is not required initially; a future indexer enhancement could provide it for very large multisigs.
 
 ### Suggested deployment timeline
 
@@ -591,5 +630,5 @@ These are the design decisions the spec has not yet made. Each must be resolved 
 | # | Question | Options | Notes |
 |---|---|---|---|
 | 1 | **Per-transfer auditor address UX** | (a) Per-transfer entry only. (b) Wallet-managed address book. (c) dApp provides a list, wallet confirms. | Global and per-asset auditors are out of scope here; this concerns only optional per-transfer (voluntary) auditors. For v1, (a) or (c) is likely sufficient. |
-| 2 | **Spam-token rollover and surfacing** | How does the wallet surface unsolicited inbound tokens, and how is rollover scoped? | Suggested v1 answer: per-token rollover only (no "accept all"), show unknown tokens with a warning badge (not hidden, not blocked), no allowlist dependency in v1. Avoids gas-extraction traps and keeps spam filtering out of v1's critical path while leaving room for an allowlist-based enhancement later. |
+| 2 | **Spam-token rollover and surfacing** | How does the wallet display unsolicited inbound tokens, and how is rollover scoped? | Suggested answer: per-token rollover only (no "accept all"), display unknown tokens with a warning badge (not hidden, not blocked), no allowlist dependency. Avoids gas-extraction traps and keeps spam filtering out of the critical path while leaving room for an allowlist-based enhancement later. |
 | 3 | **Ephemeral-key expiry mid-proof (keyless)** | If the keyless ephemeral key expires between proof construction and submission, does the wallet (a) silently trigger keyless re-auth and re-sign the existing proof, or (b) surface a dedicated error and ask the user to retry? | The proof itself binds to `senderAddress` via Fiat–Shamir, not to the ephemeral key, so the proof survives re-auth and can be wrapped in a freshly-signed transaction. Affects perceived reliability for sessions held open near the ephemeral-key expiry boundary. |
