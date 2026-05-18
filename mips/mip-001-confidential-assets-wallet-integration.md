@@ -1,7 +1,7 @@
 ---
 mip: (this is determined by the MIP Manager, leave it empty when drafting)
 title: Confidential Assets — Wallet Integration
-author: "@ganymedio"
+author: ganymedio
 discussions-to:
 Status: Draft
 last-call-end-date:
