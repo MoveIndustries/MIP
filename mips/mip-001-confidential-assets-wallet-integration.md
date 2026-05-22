@@ -371,8 +371,8 @@ The module performs no curve operations, no proof verification, and holds no res
 ```
 envelope_v1 :=
     "mv-dk-enc-v1"        // 12-byte ASCII version tag, also included in AAD
-  ‖ ephemeralX25519Pub    // 32 bytes — proposer's per-share ephemeral X25519 public key
-  ‖ nonce                 // 12 bytes — AES-GCM nonce, all-zero (safe: ephemeral key unique per envelope)
+  ‖ ephemeralX25519Pub    // 32 bytes — proposer's per-envelope ephemeral X25519 public key
+  ‖ nonce                 // 12 bytes — fresh random AES-GCM nonce per envelope
   ‖ ciphertextWithTag     // 48 bytes = 32-byte dk + 16-byte GCM tag
 
 AAD := utf8("mv-dk-enc-v1")
@@ -382,7 +382,7 @@ AAD := utf8("mv-dk-enc-v1")
      ‖ recipientOwnerAddress   (32 raw bytes)
 ```
 
-Recipient X25519 pubkey is the standard birational map of their on-chain Ed25519 owner pubkey. `sharedSecret = X25519(ephemeralPriv, recipientX25519Pub)`. `aesKey = HKDF-SHA256(sharedSecret, salt = empty, info = utf8("mv-dk-share-v1") ‖ multisig ‖ token ‖ sender ‖ recipient, L = 32)`. AES-GCM-256 seals 32 bytes of `dk` under `aesKey` with the AAD shown.
+Recipient X25519 pubkey is the standard birational map of their on-chain Ed25519 owner pubkey. `sharedSecret = X25519(ephemeralPriv, recipientX25519Pub)`. `aesKey = HKDF-SHA256(sharedSecret, salt = empty, info = utf8("mv-dk-share-v1") ‖ multisig ‖ token ‖ sender ‖ recipient, L = 32)`. AES-GCM-256 seals 32 bytes of `dk` under `aesKey` with the AAD shown and the per-envelope random nonce.
 
 **Initial share flow.** One designated owner derives `dk[multisig, token]`, registers `ek[multisig, token]` via a multisig proposal, then submits one `dk_inbox::share_dk` call carrying `recipients` and `envelopes` vectors for every co-owner. Single user confirmation, single Ed25519 signature, single gas payment. An owner who has never transacted (no on-chain Ed25519 pubkey) is omitted from the share and re-shared later via a length-1 `recipients` vector.
 
