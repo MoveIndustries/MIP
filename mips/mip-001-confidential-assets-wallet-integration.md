@@ -142,12 +142,13 @@ dk[account, token] = TwistedEd25519PrivateKey.fromUniformBytes(okm)
 
 | Operation | Behavior |
 |---|---|
-| At rest | One keystore entry per `(account, token)`, sealed under the wallet's key-encryption key. |
-| In memory | Loaded only while an operation against the corresponding token is running; zeroed on wallet lock and idle timeout. Loading `dk[X]` does not decrypt `dk[Y]`. |
-| Export | User-initiated UI action, scoped to one `(account, token)`. Gated by master-password re-prompt and typed asset-name confirmation. Returns a single 32-byte hex string. No bulk export. No dApp-callable export. |
-| Import | User-initiated UI action, scoped to one `(account, token)`. Imported entries are labeled `imported`. |
-| Backup | For software, mnemonic recovery reproduces every natively derived `dk[token]`. For hardware, re-pairing the same device reproduces them. For keyless, pepper recovery reproduces them. Imported `dk` entries are reproduced by **none** of these and must be retained out of band. |
-| Display | The wallet may display `ek[token]`. `dk[token]` bytes appear only inside the export confirmation flow. |
+| At rest | One keystore entry per `(account, token)`, sealed under the wallet's key-encryption key. For multisig vault entries: one additional `dk[Vault]` keystore entry keyed by `multisigAddress`, sealed under the same key. |
+| In memory | Loaded only while an operation against the corresponding token (or vault) is running; zeroed on wallet lock and idle timeout. Loading `dk[X]` does not decrypt `dk[Y]`. `dk[Vault]` is loaded on demand when deriving `dk[Vault, token]` and zeroed immediately after the derivation cache for the active operation is built. |
+| Export | User-initiated UI action, scoped to one `(account, token)` or one `(vault)`. Gated by master-password re-prompt and typed asset-name / vault-label confirmation. Returns a single 32-byte hex string (`mv-dk-v1:` for per-asset, `mv-dk-vault-raw-v1:` for `dk[Vault]`). No bulk export. No dApp-callable export. |
+| Import | User-initiated UI action, scoped to one `(account, token)` or one `(vault)`. Imported entries are labeled `imported`. Importing `dk[Vault]` triggers local derivation of `dk[Vault, token]` for every currently registered asset on the vault. |
+| Backup | For software, mnemonic recovery reproduces every natively derived `dk[token]`. For hardware, re-pairing the same device reproduces them. For keyless, pepper recovery reproduces them. **`dk[Vault]` is not reproduced by any of these paths** — it is uniformly random material held only by participants of the vault. Users must either back up `dk[Vault]` out of band (export to a secure offline store) or rely on the recovery flow below to re-receive it from another participant. |
+| Display | The wallet may display `ek[token]`. `dk[token]` and `dk[Vault]` bytes appear only inside the export confirmation flow. |
+| Recovery | A participant who has lost `dk[Vault]` (device wipe, OS crash without backup, fresh wallet install) re-acquires it through the same envelope flow as a newly added owner. Any current holder of `dk[Vault]` — not only the original dealer — may post a single-recipient envelope to the off-chain store addressed to the recovering participant. The recovering wallet detects the missing `dk[Vault]` and surfaces a "Vault dk missing — request re-share" action that signals other participants out of band; or any holder can initiate the re-share unprompted. |
 
 #### Security invariants
 
@@ -346,7 +347,56 @@ AAD_i := utf8("mv-dk-vault-v1")
        ‖ ephemeralX25519Pub      (32 raw bytes)
 ```
 
-Recipient X25519 pubkey is the standard birational map of the on-chain Ed25519 owner pubkey. `sharedSecret_i = X25519(ephemeralPriv, recipientX25519Pub_i)`. `aesKey_i = HKDF-SHA256(sharedSecret_i, salt = utf8("mv-dk-vault-v1"), info = utf8("mv-dk-vault-v1") ‖ multisig ‖ dealer ‖ recipient_i ‖ ephemeralX25519Pub, L = 32)`. AES-GCM-256 seals the 32 bytes of `dk[Vault]` under `aesKey_i` with `AAD_i` and the per-recipient random nonce. Per-recipient `aesKey_i` are forgotten by the dealer immediately after sealing.
+Recipient X25519 pubkey is the standard birational map of the on-chain Ed25519 owner pubkey.
+
+**Per-recipient sealing (dealer side, run once per recipient `i` for a given envelope):**
+
+```
+ephemeralPriv         = random 32-byte X25519 scalar
+ephemeralX25519Pub    = X25519_basepoint(ephemeralPriv)                  // reused across all recipients in this envelope
+recipientX25519Pub_i  = Ed25519ToX25519Pub(recipientEd25519Pub_i)        // RFC 7748 birational map
+sharedSecret_i        = X25519(ephemeralPriv, recipientX25519Pub_i)
+aesKey_i              = HKDF-SHA256(
+                          salt = utf8("mv-dk-vault-v1"),
+                          ikm  = sharedSecret_i,
+                          info = utf8("mv-dk-vault-v1")
+                               ‖ multisigAddress
+                               ‖ dealerOwnerAddress
+                               ‖ recipientOwnerAddress_i
+                               ‖ ephemeralX25519Pub,
+                          L    = 32)
+nonce_i               = random 12 bytes                                  // unique per (envelope, recipient)
+ciphertextWithTag_i   = AES-GCM-256-Seal(
+                          key       = aesKey_i,
+                          nonce     = nonce_i,
+                          plaintext = dk[Vault],                         // 32 bytes
+                          aad       = AAD_i)                             // 48-byte output: 32-byte dk + 16-byte tag
+```
+
+After sealing, the dealer zeroes `ephemeralPriv`, every `sharedSecret_i`, and every `aesKey_i`. `dk[Vault]` remains in the dealer's per-vault keystore entry.
+
+**Per-recipient opening (recipient side):**
+
+```
+recipientX25519Priv   = Ed25519ToX25519Priv(recipientEd25519Priv)        // RFC 7748 clamp/map
+sharedSecret          = X25519(recipientX25519Priv, ephemeralX25519Pub)
+aesKey                = HKDF-SHA256(
+                          salt = utf8("mv-dk-vault-v1"),
+                          ikm  = sharedSecret,
+                          info = utf8("mv-dk-vault-v1")
+                               ‖ multisigAddress
+                               ‖ dealerOwnerAddress
+                               ‖ recipientOwnerAddress
+                               ‖ ephemeralX25519Pub,
+                          L    = 32)
+dk[Vault]             = AES-GCM-256-Open(
+                          key        = aesKey,
+                          nonce      = nonce_i,
+                          ciphertext = ciphertextWithTag_i,
+                          aad        = AAD)
+```
+
+The recipient verifies AAD on open; any mismatch (wrong `multisigAddress`, `dealerOwnerAddress`, `recipientOwnerAddress`, or `ephemeralX25519Pub`) causes opening to fail and the envelope is discarded. After successful opening the recipient zeroes `sharedSecret` and `aesKey`, persists `dk[Vault]` to the per-vault keystore entry, and acknowledges the read to the off-chain store.
 
 **Initial share flow.** The dealer's wallet generates `dk[Vault]`, fetches the multisig's owner set from chain and reads each owner's on-chain Ed25519 pubkey, builds one envelope with one ciphertext slot per co-owner, and posts it to the multisig vault application's envelope store under the vault's identifier. The application surfaces a "Pending dk share" notification on each recipient's view of the vault. Each recipient's wallet fetches the envelope, parses out its own `(nonce_i, ciphertextWithTag_i)`, decrypts with its X25519 key (derived from the owner's Ed25519 signing key), persists `dk[Vault]` to the per-vault keystore entry, and acknowledges the read to the store. When the store sees acknowledgements from every recipient, it deletes the envelope. The dealer may also explicitly revoke and re-share if the share window stalls.
 
@@ -354,7 +404,7 @@ An owner who has never transacted (no on-chain Ed25519 pubkey) is omitted from t
 
 **Owner additions and removals:**
 
-- **Owner added.** The dk-management surface diffs the on-chain owner set against the local `dk[Vault]` presence. When the wallet detects an owner without `dk[Vault]`, it surfaces a "Share vault dk with new owner 0xefgh…" action, gated by explicit confirmation that surfaces the new owner's address. The share posts a length-1 envelope to the off-chain store.
+- **Owner added.** The dk-management surface diffs the on-chain owner set against the local `dk[Vault]` presence. When the wallet detects an owner without `dk[Vault]`, it surfaces a "Share vault dk with new owner 0xefgh…" action, gated by explicit confirmation that surfaces the new owner's address. The share posts a length-1 envelope to the off-chain store. Any current holder of `dk[Vault]` may initiate this re-share — the original dealer is not a privileged party after the initial bootstrap.
 - **Owner removed.** A removed owner retains `dk[Vault]` locally — neither the chain nor the multisig vault application can reach into their wallet — and retains decryption capability for past and future ciphertexts under every registered `ek[Vault, token]`. Funds remain safe (k-of-n approvals still required). Remaining owners generate a fresh `dk[Vault]`, rotate `ek` per affected token via the SDK's `rotate_encryption_key`, and re-share the new `dk[Vault]` to the remaining owners. The wallet detects the owner-set change on chain and surfaces a banner listing the rotation/re-share work pending.
 
 The wallet must warn before proposing removal of an owner if `dk[Vault]` is not currently held by at least one remaining owner — rotation requires the current `dk[Vault]` to construct its proofs.
