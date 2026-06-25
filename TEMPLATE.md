@@ -4,10 +4,10 @@ title: (MIP title)
 author: <a list of the author's or authors' name(s) and/or username(s), or name(s) and email(s). Details are below.>
 discussions-to (*optional): <a url pointing to the official discussion thread>
 Status: <Draft | Last Call | Accepted | Final | Rejected>
-last-call-end-date (*optional): <mm/dd/yyyy the last date to leave feedbacks and reviews>
+last-call-end-date (*optional): <yyyy-mm-dd the last date to leave feedbacks and reviews>
 type: <Standard (Core, Networking, Interface, Application, Framework) | Informational | Process>
-created: <mm/dd/yyyy>
-updated (*optional): <mm/dd/yyyy>
+created: <yyyy-mm-dd>
+updated (*optional): <yyyy-mm-dd>
 requires (*optional): <MIP number(s)>
 ---
 
