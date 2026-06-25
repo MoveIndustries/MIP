@@ -333,6 +333,7 @@ Only the proposer needs `dk[Vault, token]` for the in-flight proposal. Approvers
 envelope_v1 :=
     "mv-dk-vault-v1"          // 14-byte ASCII version tag, also included in AAD
   ‖ multisigAddress           // 32 raw bytes
+  ‖ dealerOwnerAddress        // 32 raw bytes — owner who sealed this envelope; authenticated via AAD
   ‖ ephemeralX25519Pub        // 32 bytes — dealer's per-share ephemeral X25519 public key
   ‖ recipientCount            // u16 little-endian
   ‖ for each recipient i:
@@ -347,7 +348,7 @@ AAD_i := utf8("mv-dk-vault-v1")
        ‖ ephemeralX25519Pub      (32 raw bytes)
 ```
 
-Recipient X25519 pubkey is the standard birational map of the on-chain Ed25519 owner pubkey.
+Recipient X25519 pubkey is the standard birational map of the on-chain Ed25519 owner pubkey. `dealerOwnerAddress` rides in the envelope header (not in any per-recipient slot) so every recipient recovers the same value the dealer bound into the HKDF `info` and the AAD; it carries no separate `openVaultDk` parameter. The header copy is unauthenticated on its own, but the seal binds it through both the HKDF `info` and the AAD, so any tampering changes the derived `aesKey` or fails the GCM tag and the open is rejected.
 
 **Per-recipient sealing (dealer side, run once per recipient `i` for a given envelope):**
 
@@ -398,7 +399,7 @@ dk[Vault]             = AES-GCM-256-Open(
 
 The recipient verifies AAD on open; any mismatch (wrong `multisigAddress`, `dealerOwnerAddress`, `recipientOwnerAddress`, or `ephemeralX25519Pub`) causes opening to fail and the envelope is discarded. After successful opening the recipient zeroes `sharedSecret` and `aesKey`, persists `dk[Vault]` to the per-vault keystore entry, and acknowledges the read to the off-chain store.
 
-**Initial share flow.** The dealer's wallet generates `dk[Vault]`, fetches the multisig's owner set from chain and reads each owner's on-chain Ed25519 pubkey, builds one envelope with one ciphertext slot per co-owner, and posts it to the multisig vault application's envelope store under the vault's identifier. The application surfaces a "Pending dk share" notification on each recipient's view of the vault. Each recipient's wallet fetches the envelope, parses out its own `(nonce_i, ciphertextWithTag_i)`, decrypts with its X25519 key (derived from the owner's Ed25519 signing key), persists `dk[Vault]` to the per-vault keystore entry, and acknowledges the read to the store. When the store sees acknowledgements from every recipient, it deletes the envelope. The dealer may also explicitly revoke and re-share if the share window stalls.
+**Initial share flow.** The dealer's wallet generates `dk[Vault]`, fetches the multisig's owner set from chain and reads each owner's on-chain Ed25519 pubkey, builds one envelope with one ciphertext slot per co-owner, and posts it to the multisig vault application's envelope store under the vault's identifier. The application surfaces a "Pending dk share" notification on each recipient's view of the vault. Each recipient's wallet fetches the envelope, reads the header `dealerOwnerAddress` and `ephemeralX25519Pub`, parses out its own `(nonce_i, ciphertextWithTag_i)`, decrypts with its X25519 key (derived from the owner's Ed25519 signing key), persists `dk[Vault]` to the per-vault keystore entry, and acknowledges the read to the store. When the store sees acknowledgements from every recipient, it deletes the envelope. The dealer may also explicitly revoke and re-share if the share window stalls.
 
 An owner who has never transacted (no on-chain Ed25519 pubkey) is omitted from the initial share and re-shared later via a single-recipient envelope as soon as their pubkey is on chain.
 
