@@ -1,6 +1,6 @@
 ---
 mip: (this is determined by the MIP Manager, leave it empty when drafting)
-title: Shielded Zones
+title: Auditable Shielded Pools
 author: ganymedio
 discussions-to:
 Status: Draft
@@ -11,13 +11,13 @@ updated:
 requires:
 ---
 
-# MIP-X - Shielded Zones
+# MIP-X - Auditable Shielded Pools
 
-**File naming convention:** When merged this file should be renamed to `mip-<NNN>-shielded-zones.md` with the number assigned by the MIP Manager. Diagrams, if any, belong under `mips/diagrams/mip-<NNN>/`.
+**File naming convention:** When merged this file should be renamed to `mip-<NNN>-auditable-shielded-pools.md` with the number assigned by the MIP Manager. Diagrams, if any, belong under `mips/diagrams/mip-<NNN>/`.
 
 ## Summary
 
-This MIP specifies **Shielded Zones**, a design for private token transfers on Movement, together with the cryptographic primitive stack it requires. Value is held in **a single on-chain shielded pool** that supports any number of fungible assets — all sharing one commitment tree, so the anonymity set spans every asset. Every private transfer has an *audit scope*: one or more approved auditors, chosen per transfer, that can decrypt it. That per-transfer audit scope is what a **Shielded Zone** is — not a place funds live.
+This MIP specifies **auditable shielded pools**, a design for private token transfers on Movement, together with the cryptographic primitive stack it requires. Value is held in **a single on-chain shielded pool** that supports any number of fungible assets — all sharing one commitment tree, so the anonymity set spans every asset. Every private transfer has an *audit scope*: one or more auditors, chosen per transfer by the operator, that can decrypt it. That per-transfer audit scope is a transfer's **auditor zone** — not a place funds live.
 
 A user *deposits* tokens to shield them (creating a private UTXO-style *note*), *transfers* value privately to any receiver, and *withdraws* to unshield. Transfers are proved by the sender's own client and **verified on-chain**, so no off-chain ledger is required and only the sender can construct a spend.
 
@@ -25,7 +25,7 @@ Privacy is delivered through a **relayer**, run by the institution that guarante
 
 The relayer performs one additional, mandatory task: it attaches **auditor data** — an encryption of the transfer's `(receiver, amount)` to at least one auditor — and proves on-chain that the auditor's ciphertext faithfully encrypts the same values the transfer moves. The operator and the relayer are the same party: the auditing institution operates (or facilitates) the relayer, so it is necessarily the entity that names the auditors and constructs their data.
 
-As in a Tempo Zone, that institution can observe all transaction information. Unlike a Tempo Zone, funds are not confined to a zone: a sender may pay any receiver, and a **Shielded Zone** here is only the **audit scope** (which auditors participate), chosen per transfer by the relayer.
+That institution can observe all transaction information for the transfers it relays; transfers relayed by another operator are not visible to it. Funds are not confined to a zone: a sender may pay any receiver, and an **auditor zone** here is only the **audit scope** (which auditors participate), chosen per transfer by the operator.
 
 The primitive that establishes this assurance is the **auditor-binding proof**, which guarantees that a relayed transfer contains exactly the data it declares to the auditor (receiver and amount). Neither a dishonest sender nor a dishonest relayer can submit inconsistent data: the sender's transfer proof binds the true `(receiver, amount)` into the output note commitment, and the relayer's auditor-binding proof ties the auditor's ciphertext to that same commitment.
 
@@ -36,8 +36,8 @@ In scope: the primitive stack (P1–P9); the three operations (deposit, transfer
 ### Out of scope
 
 - **Off-chain operator ledgers / rollups.** This design executes and verifies transfers **on-chain**. A separate off-chain "zone ledger" model is explicitly not proposed here.
-- **Legal accreditation of auditors.** The on-chain approved-auditor set and its admin control are specified here; how an auditor is vetted as a legitimate legal entity off-chain, before its key is approved, is a policy matter outside this MIP.
-- **Relayer economics.** Fees, incentives, and gas-paymaster accounting are out of scope; only the cryptographic property that lets a relayer submit on a sender's behalf (proof + nullifier authorize, not the submitter's identity) is specified.
+- **Legal accreditation of auditors.** Auditor selection is permissionless at the protocol layer: the operator names the auditor and is responsible for its legitimacy. How an auditor is vetted as a legal entity off-chain is a policy matter outside this MIP.
+- **Relayer economics.** Incentives and gas-paymaster accounting are out of scope for v1; a relayer-set transfer fee is planned for v2 (see [Future Potential](#future-potential)). Only the cryptographic property that lets a relayer submit on a sender's behalf (proof + nullifier authorize, not the submitter's identity) is specified here.
 - **Swaps and arbitrary in-pool computation.** The pool supports shielded transfers only.
 - **Trusted-setup ceremony logistics.** A multi-party ceremony per circuit is required and justified; the coordinator, contributor set, and transcript format are not specified here.
 - **A new hash or curve.** This MIP composes established primitives (Poseidon, Groth16/BN254, embedded-curve ElGamal/ECDH, X25519 + HKDF + AEAD). It introduces no novel cryptography.
@@ -49,13 +49,13 @@ The pool is a conventional on-chain shielded pool — commitment tree, nullifier
 ```mermaid
 flowchart TD
     Sender(["Sender<br/>1. builds transfer proof, M ≤ N"])
-    Relayer["Off-chain relayer (auditing institution)<br/>3. adds approved-auditor data + binding"]
+    Relayer["Off-chain relayer (auditing institution)<br/>3. adds auditor data + binding"]
     Receiver([Receiver])
 
     subgraph MN["Movement blockchain"]
         Pool["Token shielded pool (multi-asset)<br/>5. verifies proof + auditor binding"]
     end
-    subgraph ZONE["Shielded Zone — this transfer's audit scope"]
+    subgraph ZONE["Auditor zone — this transfer's audit scope"]
         Auditor([Auditor])
     end
 
@@ -80,11 +80,11 @@ Second, **auditing is mandatory and provably faithful.** A private transfer that
 
 Every transfer therefore carries, for at least one auditor, a ciphertext of the transfer detail under the auditor's key, and the relayer proves on-chain that this ciphertext encrypts exactly the `(receiver, amount)` committed in the transfer. The relayer attaches this data because it is operated by the auditing institution itself: it selects the auditors and is trusted to observe the transaction in cleartext.
 
-The approved auditor(s) attached to a transfer are that transfer's **Shielded Zone** — its audit scope, and the only sense in which a "zone" exists here: not an environment funds enter, but the set of auditors under which the transfer is auditable. This is what the diagram's `Shielded Zone` box marks.
+The auditor(s) attached to a transfer are that transfer's **auditor zone** — its audit scope, and the only sense in which a "zone" exists here: not an environment funds enter, but the set of auditors under which the transfer is auditable. This is what the diagram's `Auditor zone` box marks.
 
 The sender discloses the recipient note opening to the relayer, which verifies it against the public output commitment before constructing the auditor material. The chain enforces that at least one valid auditor binding is present, so the relayer cannot omit it and the sender cannot misrepresent the recipient or amount.
 
-Because a zone is only this audit scope, it does not custody funds or constrain the recipient — the sharp break from Tempo, where a zone is an environment funds live in. A sender may pay any receiver directly, and the pool's transfer and withdraw entrypoints are callable by other Move modules, so a shielded pool composes into larger applications rather than confining funds within an environment.
+Because a zone is only this audit scope, it does not custody funds or constrain the recipient: it is not an environment funds live in. A sender may pay any receiver directly, and the pool's transfer and withdraw entrypoints are callable by other Move modules, so a shielded pool composes into larger applications rather than confining funds within an environment.
 
 ## Impact
 
@@ -93,11 +93,11 @@ Because a zone is only this audit scope, it does not custody funds or constrain 
 - **Protocol / framework maintainers.** BN254 pairing and scalar-field arithmetic are provided by the framework's `aptos_std::bn254_algebra` (`G1`/`G2`/`Gt`/`Fr`) and `aptos_std::crypto_algebra` (`multi_pairing`, `pairing`, `scalar_mul`), so no new curve or pairing code is required; the network must have the framework's generic-algebra feature enabled. The new cryptographic Move code is therefore limited to a thin Groth16 verifier (~150 lines) over those pairings and a Poseidon module with circom-compatible constants — the primary audit surface.
 - **Auditing institutions (relayer operators).** Operate the relayer — the operator and the relayer are one party. Receive a sender's transfer proof and recipient-note opening, verify the opening against the transfer's output commitment, select the auditor(s) for the transfer, encrypt the audit data to each, build the auditor-binding proof, and submit the transaction as the on-chain sender. The relayer observes full transaction detail (this is required for compliance) and must safeguard it.
 - **Client / wallet developers.** Custody the dual-key material, track notes, build deposit/transfer/withdraw proofs client-side, encrypt output notes to receivers, and disclose the recipient note opening to the relayer for a relayed transfer. Byte layouts for every hashed/encrypted structure are the compatibility contract and must match relayer and chain exactly.
-- **Auditors.** Hold the key under which per-transfer audit data is encrypted; decrypt on-chain auditor ciphertext to recover the true `(receiver, amount)`. Auditors are named per transfer by the relayer and must be drawn from a governance-gated set (companion MIP).
+- **Auditors.** Hold the key under which per-transfer audit data is encrypted; decrypt on-chain auditor ciphertext to recover the true `(receiver, amount)`. Auditors are named per transfer by the operator, which is responsible for their legitimacy; auditor selection is permissionless at the protocol layer.
 - **KYC attesters.** Where KYC is enforced on-chain, publish attestations into the pool's attestation tree; where it is relayer-enforced, gate relay service on off-chain KYC.
 - **Contract integrators.** Call the pool's transfer/withdraw entrypoints from other modules to embed shielded payments in larger applications.
 
-**Dependencies.** No dependency on prior MIPs. This MIP is the base shielded-pool standard; auditor governance, wallet-integration interface, and KYC-attestation specifics build on the contracts fixed here.
+**Dependencies.** No dependency on prior MIPs. This MIP is the base shielded-pool standard; the wallet-integration interface and KYC-attestation specifics build on the contracts fixed here, and any future auditor-governance policy layers on top without changing them.
 
 ## Alternative Solutions
 
@@ -139,30 +139,17 @@ Poseidon over BN254 with circom-compatible constants so the in-circuit and on-ch
 4. **Relaying is permissionless at the cryptographic layer.** Transfers authorize on proof + nullifier, never on submitter identity, so a relayer may act as sender without gaining the ability to alter the transfer or move funds.
 5. **Byte layouts are the compatibility contract.** Field orderings, endianness, address reduction, and domain separators are pinned here and reproduced identically by client, relayer, and chain.
 
-### Shielded Zones
+### Auditor zones
 
-A **Shielded Zone** is the *audit scope* of a transfer: the approved auditor(s) under which that transfer is audited. It is not an object funds live in, and it is not registered per institution — it is simply which auditor(s) the relayer selects for a given transfer. A zone does not custody funds and does not constrain the recipient; it names *who audits*, not *where value may go*.
+An **auditor zone** is the *audit scope* of a transfer: the auditor(s) under which that transfer is audited. It is not an object funds live in, and it is not registered per institution — it is simply which auditor(s) the operator selects for a given transfer. A zone does not custody funds and does not constrain the recipient; it names *who audits*, not *where value may go*.
 
-**A zone is per transfer, not a place funds live.** A note in the pool belongs to no zone. Each transfer independently names its auditors, so the same sender's transfers can be audited by different auditors, and a note can be spent under auditors unrelated to whatever transfer created it.
+**A zone is per transfer, not a place funds live.** A note in the pool belongs to no zone. Each transfer independently names its auditors, so the same sender's transfers can be audited by different auditors, and a note can be spent under auditors unrelated to whatever transfer created it. There is nothing to "move between": a different audit scope is just different auditors on the next transfer.
 
-Unlike Tempo — where funds sit inside a zone and "moving between zones" means withdraw-then-deposit — there is nothing here to move between. A different audit scope is just different approved auditors on the next transfer.
+**Auditor selection is permissionless.** The protocol maintains no approved-auditor list. The operator that relays a transfer chooses its auditor(s) and is responsible — legally and operationally — for naming a legitimate, accountable auditor; the user in turn chooses which operator to transact through. The chain does not judge who is a valid auditor; it enforces only that every private transfer carries at least one *faithful* auditor binding (P9).
 
-**On-chain state.** The only zone-related state on-chain is a single global set of **approved auditor public keys** — the auditors the protocol recognizes:
+**On-chain state.** There is no zone object, no `zone_id`, no per-institution registration, and no approved-auditor set. The auditor for a transfer appears only as the `auditor_pubkey` carried in that transfer's P9 binding, and the rule is asset-agnostic: it applies to a transfer of any supported asset.
 
-```move
-struct ApprovedAuditors has key {
-    keys: Table<vector<u8>, bool>,  // auditor pubkey -> approved
-    admin: address,
-}
-public entry fun approve_auditor(admin: &signer, auditor_pubkey: vector<u8>)
-public entry fun revoke_auditor(admin: &signer, auditor_pubkey: vector<u8>)
-```
-
-There is no zone object, no `zone_id`, and no per-institution registration. Revoking an auditor removes its key from the set; there is no separate enable/disable flag. The set is asset-agnostic: it applies to a transfer of any supported asset.
-
-**Binding a transfer to its audit scope.** For each transfer the relayer selects one or more approved auditors and attaches, per auditor, a P9 ciphertext and binding proof. The pool requires at least one, and for each verifies that (1) the `auditor_pubkey` is a member of `ApprovedAuditors` and (2) the binding proof ties the ciphertext to the transfer's recipient output commitment. A transfer with zero valid bindings, or any binding under an unapproved key, is rejected.
-
-**Admin.** The `admin` field is the only administrative control, and it is deliberately narrow: it decides which auditor keys are approved — that is, asserts that a key belongs to an accountable auditor. Who holds it — a protocol council, per-issuer approval, or a permissionless model with acceptance left to downstream policy — is left open ([Open Questions](#open-questions)).
+**Binding a transfer to its audit scope.** For each transfer the operator selects one or more auditors and attaches, per auditor, a P9 ciphertext and binding proof. The pool requires at least one and verifies that the binding proof ties the ciphertext to the transfer's recipient output commitment. A transfer with zero valid bindings is rejected.
 
 ### The primitive stack
 
@@ -256,7 +243,7 @@ flowchart LR
   - **Encryption (ZK-friendly).** For auditor public key `A` on an embedded curve (base field = BN254 scalar field): sample ephemeral `k`, compute `R = k·G` and shared secret `S = k·A`; derive a Poseidon keystream from `S` and mask the audit plaintext `(owner_pubkey, amount, token_reduced)` — the recipient's in-pool identity, the amount, and the token. Ciphertext is `(R, masked_fields)`. Every step is Poseidon or embedded-curve arithmetic, so correctness is cheap to prove.
   - **Binding proof (relayer-generated, audit circuit).** Public inputs `[recipient_output_commitment, auditor_pubkey, auditor_ciphertext]`. Proves `∃ (token, amount, owner_pubkey, salt)` such that `recipient_output_commitment = Poseidon-t5(token, amount, owner_pubkey, salt)` (the note commitment of P6) **and** `auditor_ciphertext = ZKEnc(auditor_pubkey; owner_pubkey, amount, token)`. The `recipient_output_commitment` is the *same* public value the transfer proof (P-transfer) produced, which is what ties the two proofs to one transfer.
   - **Sender→relayer handoff (the "proof from the user").** The sender discloses the opening `(token, amount, owner_pubkey, salt)` of the recipient output note to the relayer. The relayer recomputes `Poseidon-t5(...)` and checks it equals the public `recipient_output_commitment` — a self-checking disclosure that convinces the relayer the declared recipient (its in-pool `owner_pubkey`) and amount are exactly what the transfer moves, before it spends effort building the on-chain binding.
-  - **On-chain enforcement.** The pool verifies P-transfer, then requires ≥1 auditor binding proof, each verified against the transfer's `recipient_output_commitment`, with `auditor_pubkey` a member of the `ApprovedAuditors` set. A transfer with zero valid bindings is rejected.
+  - **On-chain enforcement.** The pool verifies P-transfer, then requires ≥1 auditor binding proof, each verified against the transfer's `recipient_output_commitment`. A transfer with zero valid bindings is rejected. The `auditor_pubkey` is chosen by the operator and is not checked against any on-chain list.
 
 **Why P9 is central.** In this design the sender proves the transfer and the *relayer* attaches the compliance data. This division of roles is where trust could be violated: a sender could declare one recipient or amount while moving another, or a relayer could attach auditor data that the auditor cannot decrypt.
 
@@ -284,10 +271,10 @@ sequenceDiagram
     U->>U: build transfer proof (P-transfer)<br/>output note binds (receiver, amount) into commitment
     U->>R: transfer proof + recipient note opening (token, amount, receiver, salt)
     R->>R: recompute Poseidon commitment, assert == public recipient_output_commitment
-    R->>R: select approved auditor(s), ZK-encrypt audit data (P9) to each, build binding proof(s)
+    R->>R: select auditor(s), ZK-encrypt audit data (P9) to each, build binding proof(s)
     R->>P: submit Tx (relayer = on-chain sender): P-transfer + audit proof(s) + ciphertext(s)
     P->>V: verify P-transfer (root known, nullifiers unspent, value preserved)
-    P->>V: verify ≥1 audit proof vs recipient_output_commitment, auditor is approved
+    P->>V: verify ≥1 audit proof vs recipient_output_commitment
     V-->>P: ok
     P->>P: mark nullifiers spent, insert output commitments, emit receiver memo + auditor ciphertext(s)
     A-->>A: later, decrypt auditor ciphertext to recover true (receiver, amount)
@@ -308,11 +295,11 @@ A single pool supports every enabled asset. It holds:
 | `nullifiers` | spent-nullifier set (P4) |
 | `kyc_root` (optional) | current attestation-tree root, when KYC is enforced on-chain |
 
-Auditor keys are not held per pool. The set of approved auditor keys is a single global `ApprovedAuditors` resource (see [Shielded Zones](#shielded-zones)), independent of the pool and asset-agnostic: the pool consults it for a transfer of any asset. On a `transfer`, the pool checks each attached auditor key against it through a cross-module call. A note records no auditor — the audit scope is a property of the transfer, not of the note or the pool.
+Auditor keys are not held on-chain and there is no approved-auditor set (see [Auditor zones](#auditor-zones)). On a `transfer`, the pool checks only that each attached auditor binding is faithful to the recipient output commitment; the `auditor_pubkey` itself is chosen by the operator. A note records no auditor — the audit scope is a property of the transfer, not of the note or the pool.
 
-**Operations (normative):** `initialize_pool(token, config)`; `deposit(depositor, commitment, amount, proof)`; `transfer(submitter, transfer_proof, audit_proofs[], ciphertexts[], root)` — requires ≥1 valid audit binding under an approved auditor; `withdraw(submitter, nullifier, amount, recipient, root, proof)`. `transfer` and `withdraw` ignore the submitter's identity (proof + nullifier authorize), enabling relaying. `transfer`/`withdraw` are public entry functions callable by other modules (composability).
+**Operations (normative):** `initialize_pool(token, config)`; `deposit(depositor, commitment, amount, proof)`; `transfer(submitter, transfer_proof, audit_proofs[], ciphertexts[], root)` — requires ≥1 valid audit binding; `withdraw(submitter, nullifier, amount, recipient, root, proof)`. `transfer` and `withdraw` ignore the submitter's identity (proof + nullifier authorize), enabling relaying. `transfer`/`withdraw` are public entry functions callable by other modules (composability).
 
-**Invariants.** Custody funds leave only through a verified `withdraw`. `transfer` aborts unless at least one `audit_proof` verifies against the transfer's recipient output commitment with an `auditor_pubkey` in `ApprovedAuditors`. Nullifier reuse aborts. Proofs against an unknown root abort.
+**Invariants.** Custody funds leave only through a verified `withdraw`. `transfer` aborts unless at least one `audit_proof` verifies against the transfer's recipient output commitment. Nullifier reuse aborts. Proofs against an unknown root abort.
 
 **Events:**
 
@@ -332,7 +319,7 @@ KYC is a pool-level configuration: **on-chain** — the deposit circuit proves t
 ### Client and relayer responsibilities
 
 - **Client (sender).** Custody dual keys (P7); track notes by scanning events and decrypting with the viewing key (P8); build deposit/transfer/withdraw proofs (P1) reproducing every pinned layout; for a relayed transfer, disclose the recipient note opening to the relayer.
-- **Relayer.** Verify the disclosed opening against the transfer's recipient output commitment; select one or more approved auditors to audit the transfer; ZK-encrypt audit data to each and build the auditor-binding proof(s) (P9); submit as the on-chain sender; safeguard the transaction detail it necessarily sees.
+- **Relayer.** Verify the disclosed opening against the transfer's recipient output commitment; select one or more auditors to audit the transfer; ZK-encrypt audit data to each and build the auditor-binding proof(s) (P9); submit as the on-chain sender; safeguard the transaction detail it necessarily sees.
 - **Auditor.** Decrypt on-chain auditor ciphertext with its key to recover `(receiver, amount, token)`.
 
 ### Composability
@@ -352,10 +339,10 @@ The verifier module supports a **mock** (accept-all) mode for contract tests and
 1. Replace every demo setup with a **multi-party trusted-setup ceremony per circuit** — including the `audit` circuit — with independent contributors and a public transcript.
 2. Complete **external audits** of the new cryptographic code — Poseidon, the Groth16 verifier, and especially the `audit` encryption/binding circuit — and of the pool module.
 3. **Populate a real anonymity set.** A sparse pool is not private regardless of the cryptography; a near-empty or single-note pool provides no unlinkability.
-4. Run a **production relayer** with real key custody and availability, not a demo client, and resolve who holds the auditor-approval `admin` (see [Open Questions](#open-questions)).
+4. Run a **production relayer** with real key custody and availability, not a demo client.
 5. Ship **viewing-key rotation** with historical cutoffs — a compromised viewing key otherwise leaks a recipient's history permanently.
 
-**Feature flag / enablement.** The only node-level dependency is the framework's generic-algebra (BN254) feature, which must be enabled on the network; given that, no additional node feature flag is required. Enablement is otherwise gated by publishing the Groth16 verifier and Poseidon modules, completing the per-circuit trusted setup and setting verifying keys, standing up a relayer, and approving at least one auditor in `ApprovedAuditors`.
+**Feature flag / enablement.** The only node-level dependency is the framework's generic-algebra (BN254) feature, which must be enabled on the network; given that, no additional node feature flag is required. Enablement is otherwise gated by publishing the Groth16 verifier and Poseidon modules, completing the per-circuit trusted setup and setting verifying keys, and standing up a relayer that names at least one auditor.
 
 ## Testing
 
@@ -366,7 +353,7 @@ The verifier module supports a **mock** (accept-all) mode for contract tests and
   - Nullifier (P4): double-spend rejected; distinct notes → distinct nullifiers.
   - Address reduction (P5): in-circuit and on-chain agree above and below the modulus.
   - Note commitment / receiver encryption (P6, P8): hiding/binding vectors; encrypt→decrypt round-trip; wrong key fails.
-  - **Auditor binding (P9):** the audit circuit accepts a ciphertext that encrypts the committed `(receiver, amount)` and rejects one that does not; a transfer with zero valid bindings is rejected on-chain; an `auditor_pubkey` not in `ApprovedAuditors` is rejected; the auditor decrypts the on-chain ciphertext to the true values; a relayer that alters `(receiver, amount)` relative to the transfer's output commitment cannot produce a verifying binding.
+  - **Auditor binding (P9):** the audit circuit accepts a ciphertext that encrypts the committed `(receiver, amount)` and rejects one that does not; a transfer with zero valid bindings is rejected on-chain; the auditor decrypts the on-chain ciphertext to the true values; a relayer that alters `(receiver, amount)` relative to the transfer's output commitment cannot produce a verifying binding.
 - **On-chain state machine.** deposit / transfer / withdraw happy path; KYC-gated deposit (on-chain mode); nullifier double-spend rejected; unknown-root rejected; transfer without a valid auditor binding rejected; relayer-as-sender submission (sender identity absent) — against the mock verifier, then re-run against real Groth16.
 - **End-to-end.** deposit → relayed private transfer (with auditor binding) → receiver detects note → auditor decrypts → withdraw, on devnet, including the negative test that a relayer-tampered `(receiver, amount)` fails.
 
@@ -383,7 +370,7 @@ The verifier module supports a **mock** (accept-all) mode for contract tests and
 | **Per-circuit trusted setup (Groth16).** Toxic waste lets its holder forge proofs — including a transfer that steals notes. | Multi-party ceremony per circuit with independent contributors, public transcript, published witnesses. A single-contributor "demo" setup is disqualifying for mainnet. Circuit changes re-run the ceremony. |
 | **Circuit / chain divergence (P2, P5).** Mismatched Poseidon constants or address reduction silently orphans commitments or breaks proofs. | Known-answer tests against the circuit library; address-reduction agreement tests; byte layouts pinned here. |
 | **Relayer trust.** The relayer observes full transaction detail and controls liveness and censorship of relayed transfers. | This is the model's compliance mechanism: the auditing institution runs the relayer, and this is stated explicitly. The relayer **cannot** alter recipient or amount, move funds, or omit auditing — all enforced on-chain. A user may also submit directly (forgoing sender privacy) as a fallback, and multiple relayers may provide redundant liveness. |
-| **Auditor can see everything named to it.** The named auditor recovers full `(receiver, amount)` for every transfer it audits. | Intended. Auditor scope is per-transfer and auditors are drawn from a governance-gated set; broadening or narrowing audit scope is a policy choice, not a cryptographic gap. |
+| **Auditor can see everything named to it.** The named auditor recovers full `(receiver, amount)` for every transfer it audits. | Intended. Auditor scope is per-transfer and the operator chooses the auditor; broadening or narrowing audit scope is a policy choice, not a cryptographic gap. |
 | **Weak anonymity set.** A sparse pool gives weak unlinkability regardless of cryptography. | Anonymity grows with participation; a near-empty pool is not private. The single multi-asset pool helps — all assets share one anonymity set — but a fresh deployment still needs a population before privacy claims hold. |
 | **Auditor-binding omitted or under-specified (P9).** Without an enforced, faithful binding, a relayer could defeat auditing. | P9's binding is verified on-chain against the transfer's output commitment and ≥1 is required; this is why P9 is normative, not an implementation detail. |
 | **Sender lies about the transfer.** A sender might try to move different value than declared. | Impossible: the transfer proof binds the true `(receiver, amount)` into the output commitment, and the auditor binding is to that same commitment. |
@@ -399,7 +386,7 @@ The verifier module supports a **mock** (accept-all) mode for contract tests and
 
 Weakening P9 (for example, attaching auditor data without the on-chain binding) invalidates the compliance guarantee and is therefore disallowed.
 
-**Relayer confidentiality.** The relayer necessarily learns the transaction (it encrypts the audit data), matching the Tempo-Zone property that the operating institution sees all detail. This is a deliberate trust placement, not a leak: the *public* still learns nothing. Operators must protect the plaintext they handle; a compromised relayer discloses the transfers it processed but still cannot move funds or forge audits.
+**Relayer confidentiality.** The relayer necessarily learns the transaction (it encrypts the audit data), so the operating institution sees the full detail of the transfers it relays. This is a deliberate trust placement, not a leak: the *public* still learns nothing. Operators must protect the plaintext they handle; a compromised relayer discloses the transfers it processed but still cannot move funds or forge audits.
 
 **Nullifier soundness (P4).** Replay/double-spend protection depends on deterministic, collision-free nullifiers and on-chain duplicate rejection; fresh `salt` per note and spending-key binding prevent collisions and cross-note linkage.
 
@@ -413,13 +400,14 @@ Weakening P9 (for example, attaching auditor data without the on-chain binding) 
 
 ## Future Potential
 
+- **Relayer-set transfer fees.** A v2 fee mechanism in which the relayer sets and collects a per-transfer fee; incentive and paymaster accounting are defined there.
 - **Variable-arity transfers.** The 2-in-2-out shape is the simplest; n-in-n-out circuits enable batching and consolidation.
 - **Sender-side auditing option.** A mode where the sender, not the relayer, builds the auditor binding (for deployments that want the relayer blind to detail), at the cost of fixing the auditor set before proving.
 - **Multiple / threshold auditors.** Requiring m-of-n auditor bindings, or threshold-decryptable audit data, for higher-assurance compliance.
 - **Universal / updatable setup.** Migrating to Plonk/UltraHonk removes the per-circuit ceremony at the cost of a larger on-chain verifier; revisit as Move-side costs fall.
 - **Viewing-key rotation** with historical cutoffs to close the permanent-history-leak gap.
 - **Post-quantum channels.** The receiver channel (P8) can adopt a PQ KEM under a versioned envelope when one is ecosystem-ready.
-- **In five years.** Movement hosts shielded pools for many assets, each with a populated anonymity set, with competing compliant relayers and a governance-managed auditor set, and shielded payments embedded in mainstream applications through the composable transfer entrypoint.
+- **In five years.** Movement hosts shielded pools for many assets, each with a populated anonymity set, with competing compliant relayers naming their own auditors, and shielded payments embedded in mainstream applications through the composable transfer entrypoint.
 
 ## Timeline
 
@@ -447,9 +435,8 @@ Weakening P9 (for example, attaching auditor data without the on-chain binding) 
 | # | Question | Notes |
 |---|---|---|
 | 1 | **Auditor plaintext contents.** | Beyond `(receiver, amount, token)`, should audit data include sender-identifying material (which the relayer knows but the transfer proof does not bind)? Binding sender identity would require the sender to commit to it in the transfer. Decide before the audit circuit is finalized. |
-| 2 | **Auditor-approval authority.** | Who holds `admin` on `ApprovedAuditors` — a protocol council, per-issuer approval, or a permissionless model with acceptance left to downstream policy. Determines the trust root for "is this a legitimate auditor." |
-| 3 | **Embedded curve for P9 encryption.** | Which embedded curve (base field = BN254 scalar field) and the exact ElGamal/Poseidon-keystream layout for the auditor ciphertext. Pin as part of the compatibility contract. |
-| 4 | **Receiver-encryption curve (P8).** | X25519 (default) vs secp256k1 (reuses wallet keys). Fixed per deployment; pinned so notes are decodable across clients. |
-| 5 | **Transfer arity.** | Fixed 2-in-2-out for v1 vs variable arity. Affects the transfer circuit and change-note handling. |
-| 6 | **KYC mode default.** | On-chain attestation vs relayer-enforced as the default, and whether both are offered. |
-| 7 | **Framework vs package primitives.** | Whether Poseidon and the Groth16 verifier ship as Move-framework primitives or audited package modules. Affects audit surface and reuse. |
+| 2 | **Embedded curve for P9 encryption.** | Which embedded curve (base field = BN254 scalar field) and the exact ElGamal/Poseidon-keystream layout for the auditor ciphertext. Pin as part of the compatibility contract. |
+| 3 | **Receiver-encryption curve (P8).** | X25519 (default) vs secp256k1 (reuses wallet keys). Fixed per deployment; pinned so notes are decodable across clients. |
+| 4 | **Transfer arity.** | Fixed 2-in-2-out for v1 vs variable arity. Affects the transfer circuit and change-note handling. |
+| 5 | **KYC mode default.** | On-chain attestation vs relayer-enforced as the default, and whether both are offered. |
+| 6 | **Framework vs package primitives.** | Whether Poseidon and the Groth16 verifier ship as Move-framework primitives or audited package modules. Affects audit surface and reuse. |
