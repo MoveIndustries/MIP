@@ -15,6 +15,42 @@ requires:
 
 **File naming convention:** When merged this file should be renamed to `mip-<NNN>-confidential-assets-wallet-integration.md` with the number assigned by the MIP Manager. Diagrams, if any, belong under `mips/diagrams/mip-<NNN>/`.
 
+## TL;DR
+
+Standardizes how Movement wallets custody Confidential Assets decryption keys (`dk`) and how dApps drive CA operations, so registrations stay portable and `dk` never leaks to web origins.
+
+- **Interface:** a `ca_*` dApp ↔ wallet RPC namespace; `dk` stays in the wallet, which builds every proof.
+- **Derivation:** canonical, wallet-fixed `dk` for software / hardware / keyless backings, pinned by SDK test vectors.
+- **Multisig:** one shared per-vault `dk[Vault]`, bootstrapped to co-owners via an end-to-end-encrypted off-chain envelope (hardware co-owners included); fund movement stays k-of-n.
+- No new on-chain modules or primitives.
+
+## Contents
+
+- [Summary](#summary) · [Out of scope](#out-of-scope)
+- [High-level Overview](#high-level-overview)
+- [Impact](#impact)
+- [Alternative Solutions](#alternative-solutions)
+- [Specification and Implementation Details](#specification-and-implementation-details)
+  - [Guiding principles](#guiding-principles)
+  - [Trust boundary](#trust-boundary)
+  - [Decryption key lifecycle](#decryption-key-lifecycle) — [derivation policies](#canonical-derivation-policies), [storage/export](#storage-and-export), [invariants](#security-invariants)
+  - [Operation-by-operation design](#operation-by-operation-design)
+  - [Wallet UX decisions](#wallet-ux-decisions)
+  - [Hardware wallets](#hardware-wallets)
+  - [Keyless accounts](#keyless-accounts)
+  - [Multisig accounts](#multisig-accounts) — entry model, `dk[Vault]` lifecycle, sharing, owner changes
+  - [Auditor support](#auditor-support)
+  - [Wallet ↔ application interface](#wallet--application-interface) — [method namespace](#method-namespace), [SDK changes](#sdk-changes-required-by-this-design)
+  - [Application conformance rules](#application-conformance-rules)
+- [Reference Implementation](#reference-implementation)
+- [Testing](#testing)
+- [Risks and Drawbacks](#risks-and-drawbacks)
+- [Security Considerations](#security-considerations)
+- [Future Potential](#future-potential)
+- [Timeline](#timeline)
+- [Open Questions](#open-questions)
+- [Appendix A: Vault-`dk` envelope format and algorithms](#appendix-a-vault-dk-envelope-format-and-algorithms) — wire format, sealing, opening
+
 ## Summary
 
 The on-chain Confidential Assets protocol on Movement encrypts fungible-asset balances under per-account, per-token encryption keys (`ek[account, token]`) and verifies zero-knowledge proofs against them. The protocol is silent on how wallets custody the matching decryption keys (`dk`), how dApps request CA operations, or how multisig accounts — which have no private key — participate. Without an interface standard, every wallet and dApp re-implements derivation, storage, and the request surface, with byte-level divergence orphaning on-chain registrations and a real risk of `dk` leakage into web origins.
@@ -353,88 +389,14 @@ Publishing a public key discloses nothing; `dk[Vault]` still travels only inside
 ```
 { ownerAddress, vekPub, ownerSig }
 ownerSig = Ed25519-Sign(ownerSigningKey,
-             utf8("MovementConfidentialAsset/VaultEnvelopeKey/v1") ‖ vekPub)
+             utf8("MovementConfidentialAsset/VaultEnvelopeKey/v1") ‖ ownerAddress ‖ vekPub)
 ```
 
-Before sealing, the dealer fetches the recipient's entry and **verifies `ownerSig` against the owner's on-chain Ed25519 public key**, refusing to seal to a missing or unverified key. This keeps the store's trust boundary intact: it never sees `dk[Vault]`, and it cannot swap a recipient key without forging that owner's Ed25519 signature. On hardware, both `ownerSig` and the `vek` derivation are one-time device signatures.
+Before sealing, the dealer fetches the recipient's entry and **verifies `ownerSig` over `domain ‖ ownerAddress ‖ vekPub` against the owner's on-chain Ed25519 public key**, refusing to seal to a missing or unverified key. This keeps the store's trust boundary intact: it never sees `dk[Vault]`, and it cannot swap a recipient key without forging that owner's Ed25519 signature. Binding `ownerAddress` into the signed payload also stops a valid signature from being replayed into an entry claiming a different address — which matters because one Ed25519 signing key can be authoritative for more than one account (key rotation, or a reused key). On hardware, both `ownerSig` and the `vek` derivation are one-time device signatures.
 
 An owner must publish a verifiable `vek_pub` before it can receive any envelope. A co-owner with no published `vek_pub` yet is skipped in the initial share, prompted to publish, and re-shared once its entry is present.
 
-**Envelope format.** A single envelope carries one ephemeral X25519 public key plus one per-recipient AES-GCM ciphertext for every co-owner:
-
-```
-envelope_v1 :=
-    "mv-dk-vault-v1"          // 14-byte ASCII version tag, also included in AAD
-  ‖ multisigAddress           // 32 raw bytes
-  ‖ dealerOwnerAddress        // 32 raw bytes — owner who sealed this envelope; authenticated via AAD
-  ‖ ephemeralX25519Pub        // 32 bytes — dealer's per-share ephemeral X25519 public key
-  ‖ recipientCount            // u16 little-endian
-  ‖ for each recipient i:
-        recipientOwnerAddress // 32 raw bytes
-      ‖ nonce_i               // 12 bytes — fresh random AES-GCM nonce per recipient
-      ‖ ciphertextWithTag_i   // 48 bytes = 32-byte dk[Vault] + 16-byte GCM tag
-
-AAD_i := utf8("mv-dk-vault-v1")
-       ‖ multisigAddress         (32 raw bytes)
-       ‖ dealerOwnerAddress      (32 raw bytes)
-       ‖ recipientOwnerAddress   (32 raw bytes)
-       ‖ ephemeralX25519Pub      (32 raw bytes)
-```
-
-The recipient X25519 pubkey is the recipient's published, ownership-verified **vault-envelope key** `vek_pub` (see the **Vault-envelope key** subsection above), not a birational map of the Ed25519 owner key. (Nothing has shipped, so this is simply the definition of `v1` — no version bump was needed for the change.)
-
-`dealerOwnerAddress` rides in the envelope header (not in any per-recipient slot) so every recipient recovers the same value the dealer bound into the HKDF `info` and the AAD; it carries no separate `openVaultDk` parameter. The header copy is unauthenticated on its own, but the seal binds it through both the HKDF `info` and the AAD, so any tampering changes the derived `aesKey` or fails the GCM tag and the open is rejected.
-
-**Per-recipient sealing (dealer side, run once per recipient `i` for a given envelope):**
-
-```
-// vekPub_i is the recipient's published vault-envelope key, after the dealer has
-// verified its ownerSig against recipient i's on-chain Ed25519 pubkey. The dealer
-// refuses to seal to an unverified or missing vekPub_i.
-ephemeralPriv         = random 32-byte X25519 scalar
-ephemeralX25519Pub    = X25519_basepoint(ephemeralPriv)                  // reused across all recipients in this envelope
-sharedSecret_i        = X25519(ephemeralPriv, vekPub_i)
-aesKey_i              = HKDF-SHA256(
-                          salt = utf8("mv-dk-vault-v1"),
-                          ikm  = sharedSecret_i,
-                          info = utf8("mv-dk-vault-v1")
-                               ‖ multisigAddress
-                               ‖ dealerOwnerAddress
-                               ‖ recipientOwnerAddress_i
-                               ‖ ephemeralX25519Pub,
-                          L    = 32)
-nonce_i               = random 12 bytes                                  // unique per (envelope, recipient)
-ciphertextWithTag_i   = AES-GCM-256-Seal(
-                          key       = aesKey_i,
-                          nonce     = nonce_i,
-                          plaintext = dk[Vault],                         // 32 bytes
-                          aad       = AAD_i)                             // 48-byte output: 32-byte dk + 16-byte tag
-```
-
-After sealing, the dealer zeroes `ephemeralPriv`, every `sharedSecret_i`, and every `aesKey_i`. `dk[Vault]` remains in the dealer's per-vault keystore entry.
-
-**Per-recipient opening (recipient side):**
-
-```
-vek_priv              = reconstruct per backing (see Vault-envelope key)  // hardware: from a fresh device signature; software: mnemonic path; keyless: pepper HKDF
-sharedSecret          = X25519(vek_priv, ephemeralX25519Pub)
-aesKey                = HKDF-SHA256(
-                          salt = utf8("mv-dk-vault-v1"),
-                          ikm  = sharedSecret,
-                          info = utf8("mv-dk-vault-v1")
-                               ‖ multisigAddress
-                               ‖ dealerOwnerAddress
-                               ‖ recipientOwnerAddress
-                               ‖ ephemeralX25519Pub,
-                          L    = 32)
-dk[Vault]             = AES-GCM-256-Open(
-                          key        = aesKey,
-                          nonce      = nonce_i,
-                          ciphertext = ciphertextWithTag_i,
-                          aad        = AAD)
-```
-
-The recipient verifies AAD on open; any mismatch (wrong `multisigAddress`, `dealerOwnerAddress`, `recipientOwnerAddress`, or `ephemeralX25519Pub`) causes opening to fail and the envelope is discarded. After successful opening the recipient zeroes `sharedSecret` and `aesKey`, persists `dk[Vault]` to the per-vault keystore entry, and acknowledges the read to the off-chain store.
+**Envelope wire format and algorithms.** The `mv-dk-vault-v1` byte layout, the per-recipient sealing procedure, and the recipient-side opening procedure — the X25519 + HKDF-SHA256 + AES-GCM-256 seal/open — are specified in [Appendix A](#appendix-a-vault-dk-envelope-format-and-algorithms).
 
 **Initial share flow.** The dealer's wallet generates `dk[Vault]`, fetches the multisig's owner set from chain, reads each owner's published `vek_pub` from the vault-envelope-key registry and verifies each `ownerSig` against that owner's on-chain Ed25519 pubkey, builds one envelope with one ciphertext slot per verified co-owner, and posts it to the multisig vault application's envelope store under the vault's identifier. The application surfaces a "Pending dk share" notification on each recipient's view of the vault. Each recipient's wallet fetches the envelope, reads the header `dealerOwnerAddress` and `ephemeralX25519Pub`, parses out its own `(nonce_i, ciphertextWithTag_i)`, reconstructs `vek_priv` (a device signature on hardware) and decrypts, persists `dk[Vault]` to the per-vault keystore entry, and acknowledges the read to the store. When the store sees acknowledgements from every recipient, it deletes the envelope. The dealer may also explicitly revoke and re-share if the share window stalls.
 
@@ -555,7 +517,7 @@ The `@moveindustries/confidential-assets` package needs four changes for this MI
 1. **`withdrawWithTotalBalance` / `transferWithTotalBalance` must not auto-rollover.** Either delete the helpers (recommended) or rename them and remove the auto-rollover behavior, so they throw `INSUFFICIENT_BALANCE` whenever `actual < amount`, regardless of pending. Restores the invariant that no SDK code path silently accepts incoming funds.
 2. **Build-only API for proof construction.** Add `buildRegister` / `buildDeposit` / `buildWithdraw` / `buildConfidentialTransfer` / `buildRolloverPending` / `buildNormalize` (or a sibling `ConfidentialAssetBuilder` class). Each takes an explicit `sender: AccountAddressInput` and a `decryptionKey`, no signer, no fee payer, returns `Uint8Array` of BCS-encoded `EntryFunction` bytes. Required for multisig.
 3. **Canonical derivation helpers.** Export `tokenIndexFromMetadataAddress`, `softwareDecryptionKeyDerivationPath(accountIndex, tokenMetaAddr)`, `hardwareDecryptionKeyDerivationMessage(tokenMetaAddr)`, `keylessDecryptionKey(pepper, accountAddress, tokenMetaAddr)`, and `vaultDecryptionKey(dkVault, multisigAddress, tokenMetaAddr)` (the HKDF-SHA512 step from `dk[Vault]` to `dk[Vault, token]`). Add a new `TwistedEd25519PrivateKey.fromUniformBytes(bytes: Uint8Array)` constructor that accepts ≥ 32 bytes of uniform input and reduces modulo the Ed25519 group order ℓ (mirrors the reduction inside `fromSignature`). Test vectors in the SDK pin the byte layouts so a regression is caught upstream of any on-chain registration.
-4. **Per-vault `dk[Vault]` envelope + vault-envelope-key helpers.** Export the vault-envelope-key derivations — `vaultEnvelopeKeyDerivationMessage` (the hardware signed-message constant), and helpers that reduce each backing's `seed` to an X25519 keypair (`vek_priv`/`vek_pub`) for software (mnemonic path), hardware (device signature), and keyless (pepper HKDF) — plus `signVaultEnvelopeKey` / `verifyVaultEnvelopeKey` for the ownership signature over `utf8("MovementConfidentialAsset/VaultEnvelopeKey/v1") ‖ vekPub`. Export `sealVaultDk({ dkVault, multisigAddress, dealerOwnerAddress, recipients: { ownerAddress, vaultEnvelopePublicKey }[] })` returning the `mv-dk-vault-v1` envelope bytes, and `openVaultDk({ envelope, multisigAddress, recipientOwnerAddress, recipientVaultEnvelopePrivateKey })` returning the 32-byte `dk[Vault]`. The seal/open helpers handle the X25519 ECDH, HKDF-SHA256 key schedule, and AES-GCM-256 sealing/opening with the AAD layout in [Multisig accounts](#multisig-accounts); they take the vault-envelope key directly and do **not** touch Ed25519 owner keys. Test vectors pin every byte of the envelope layout and each `vek` derivation.
+4. **Per-vault `dk[Vault]` envelope + vault-envelope-key helpers.** Export the vault-envelope-key derivations — `vaultEnvelopeKeyDerivationMessage` (the hardware signed-message constant), and helpers that reduce each backing's `seed` to an X25519 keypair (`vek_priv`/`vek_pub`) for software (mnemonic path), hardware (device signature), and keyless (pepper HKDF) — plus `signVaultEnvelopeKey` / `verifyVaultEnvelopeKey` for the ownership signature over `utf8("MovementConfidentialAsset/VaultEnvelopeKey/v1") ‖ ownerAddress ‖ vekPub` (the `ownerAddress` binding prevents cross-address signature replay). Export `sealVaultDk({ dkVault, multisigAddress, dealerOwnerAddress, recipients: { ownerAddress, vaultEnvelopePublicKey }[] })` returning the `mv-dk-vault-v1` envelope bytes, and `openVaultDk({ envelope, multisigAddress, recipientOwnerAddress, recipientVaultEnvelopePrivateKey })` returning the 32-byte `dk[Vault]`. The seal/open helpers handle the X25519 ECDH, HKDF-SHA256 key schedule, and AES-GCM-256 sealing/opening with the AAD layout in [Appendix A](#appendix-a-vault-dk-envelope-format-and-algorithms); they take the vault-envelope key directly and do **not** touch Ed25519 owner keys. Test vectors pin every byte of the envelope layout and each `vek` derivation.
 
 #### Token addressing
 
@@ -647,7 +609,7 @@ The testing plan is split across three layers, matching where the invariants liv
 **Off-chain envelope store + key-registry trust model.** The multisig vault application hosts both the envelope store and the vault-envelope-key registry. It is trusted only for availability and honest bookkeeping — honest deletion of envelopes once recipients acknowledge, availability during the share window, and non-discriminatory delivery. It is **not** trusted for:
 
 - **Confidentiality.** `dk[Vault]` is end-to-end encrypted under per-recipient X25519 + AES-GCM keys; the store sees only ciphertext.
-- **Recipient-key integrity.** Each `vek_pub` in the registry carries an Ed25519 `ownerSig` the dealer verifies against the owner's on-chain pubkey before sealing. The store cannot substitute its own key to become a covert recipient without forging that signature.
+- **Recipient-key integrity.** Each `vek_pub` in the registry carries an Ed25519 `ownerSig` (over `domain ‖ ownerAddress ‖ vekPub`) the dealer verifies against the owner's on-chain pubkey before sealing. The store cannot substitute its own key to become a covert recipient without forging that signature, and the `ownerAddress` binding prevents an existing signature from being replayed under a different address.
 - **Fund safety.** Every fund-moving multisig transaction still requires k-of-n on-chain Ed25519 approvals.
 
 A misbehaving store (retaining envelopes despite acknowledgement, leaking ciphertext) does not directly recover `dk[Vault]`. It only widens the set of parties who could decrypt *if* a recipient's `vek_priv` later leaks. Since `vek_priv` is reconstructable from the owner's root material (device signature / mnemonic path / pepper), it inherits that material's compromise profile. Dealer revocation + re-share and the manual `mv-dk-vault-raw-v1:` import path are the fallbacks when the store itself fails.
@@ -697,3 +659,83 @@ These are the design decisions the spec has not yet made. Each must be resolved 
 | 1 | **Per-transfer auditor address UX** | (a) Per-transfer entry only. (b) Wallet-managed address book. (c) dApp provides a list, wallet confirms. | Global and per-asset auditors are out of scope here; this concerns only optional per-transfer (voluntary) auditors. For v1, (a) or (c) is likely sufficient. |
 | 2 | **Spam-token rollover and surfacing** | How does the wallet display unsolicited inbound tokens, and how is rollover scoped? | Suggested answer: per-token rollover only (no "accept all"), display unknown tokens with a warning badge (not hidden, not blocked), no allowlist dependency. Avoids gas-extraction traps and keeps spam filtering out of the critical path while leaving room for an allowlist-based enhancement later. |
 | 3 | **Ephemeral-key expiry mid-proof (keyless)** | If the keyless ephemeral key expires between proof construction and submission, does the wallet (a) silently trigger keyless re-auth and re-sign the existing proof, or (b) surface a dedicated error and ask the user to retry? | The proof itself binds to `senderAddress` via Fiat–Shamir, not to the ephemeral key, so the proof survives re-auth and can be wrapped in a freshly-signed transaction. Affects perceived reliability for sessions held open near the ephemeral-key expiry boundary. |
+
+## Appendix A: Vault-`dk` envelope format and algorithms
+
+The wire format and cryptographic procedures for the multisig `dk[Vault]` envelope, referenced from [Multisig accounts](#multisig-accounts). These define the `v1` envelope; the conceptual model, the vault-envelope key, and the share flow live in the main section.
+
+**Envelope format.** A single envelope carries one ephemeral X25519 public key plus one per-recipient AES-GCM ciphertext for every co-owner:
+
+```
+envelope_v1 :=
+    "mv-dk-vault-v1"          // 14-byte ASCII version tag, also included in AAD
+  ‖ multisigAddress           // 32 raw bytes
+  ‖ dealerOwnerAddress        // 32 raw bytes — owner who sealed this envelope; authenticated via AAD
+  ‖ ephemeralX25519Pub        // 32 bytes — dealer's per-share ephemeral X25519 public key
+  ‖ recipientCount            // u16 little-endian
+  ‖ for each recipient i:
+        recipientOwnerAddress // 32 raw bytes
+      ‖ nonce_i               // 12 bytes — fresh random AES-GCM nonce per recipient
+      ‖ ciphertextWithTag_i   // 48 bytes = 32-byte dk[Vault] + 16-byte GCM tag
+
+AAD_i := utf8("mv-dk-vault-v1")
+       ‖ multisigAddress         (32 raw bytes)
+       ‖ dealerOwnerAddress      (32 raw bytes)
+       ‖ recipientOwnerAddress   (32 raw bytes)
+       ‖ ephemeralX25519Pub      (32 raw bytes)
+```
+
+The recipient X25519 pubkey is the recipient's published, ownership-verified **vault-envelope key** `vek_pub` (see the **Vault-envelope key** subsection under [Multisig accounts](#multisig-accounts)), not a birational map of the Ed25519 owner key. (Nothing has shipped, so this is simply the definition of `v1` — no version bump was needed for the change.)
+
+`dealerOwnerAddress` rides in the envelope header (not in any per-recipient slot) so every recipient recovers the same value the dealer bound into the HKDF `info` and the AAD; it carries no separate `openVaultDk` parameter. The header copy is unauthenticated on its own, but the seal binds it through both the HKDF `info` and the AAD, so any tampering changes the derived `aesKey` or fails the GCM tag and the open is rejected.
+
+**Per-recipient sealing (dealer side, run once per recipient `i` for a given envelope):**
+
+```
+// vekPub_i is the recipient's published vault-envelope key, after the dealer has
+// verified its ownerSig against recipient i's on-chain Ed25519 pubkey. The dealer
+// refuses to seal to an unverified or missing vekPub_i.
+ephemeralPriv         = random 32-byte X25519 scalar
+ephemeralX25519Pub    = X25519_basepoint(ephemeralPriv)                  // reused across all recipients in this envelope
+sharedSecret_i        = X25519(ephemeralPriv, vekPub_i)
+aesKey_i              = HKDF-SHA256(
+                          salt = utf8("mv-dk-vault-v1"),
+                          ikm  = sharedSecret_i,
+                          info = utf8("mv-dk-vault-v1")
+                               ‖ multisigAddress
+                               ‖ dealerOwnerAddress
+                               ‖ recipientOwnerAddress_i
+                               ‖ ephemeralX25519Pub,
+                          L    = 32)
+nonce_i               = random 12 bytes                                  // unique per (envelope, recipient)
+ciphertextWithTag_i   = AES-GCM-256-Seal(
+                          key       = aesKey_i,
+                          nonce     = nonce_i,
+                          plaintext = dk[Vault],                         // 32 bytes
+                          aad       = AAD_i)                             // 48-byte output: 32-byte dk + 16-byte tag
+```
+
+After sealing, the dealer zeroes `ephemeralPriv`, every `sharedSecret_i`, and every `aesKey_i`. `dk[Vault]` remains in the dealer's per-vault keystore entry.
+
+**Per-recipient opening (recipient side):**
+
+```
+vek_priv              = reconstruct per backing (see Vault-envelope key)  // hardware: from a fresh device signature; software: mnemonic path; keyless: pepper HKDF
+sharedSecret          = X25519(vek_priv, ephemeralX25519Pub)
+aesKey                = HKDF-SHA256(
+                          salt = utf8("mv-dk-vault-v1"),
+                          ikm  = sharedSecret,
+                          info = utf8("mv-dk-vault-v1")
+                               ‖ multisigAddress
+                               ‖ dealerOwnerAddress
+                               ‖ recipientOwnerAddress
+                               ‖ ephemeralX25519Pub,
+                          L    = 32)
+dk[Vault]             = AES-GCM-256-Open(
+                          key        = aesKey,
+                          nonce      = nonce_i,
+                          ciphertext = ciphertextWithTag_i,
+                          aad        = AAD)
+```
+
+The recipient verifies AAD on open; any mismatch (wrong `multisigAddress`, `dealerOwnerAddress`, `recipientOwnerAddress`, or `ephemeralX25519Pub`) causes opening to fail and the envelope is discarded. After successful opening the recipient zeroes `sharedSecret` and `aesKey`, persists `dk[Vault]` to the per-vault keystore entry, and acknowledges the read to the off-chain store.
