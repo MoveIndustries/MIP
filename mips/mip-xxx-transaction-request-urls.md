@@ -105,7 +105,7 @@ mantissa        = 1*DIGIT [ "." 1*DIGIT ]
 **Lexical rules.**
 
 - Hex is **lowercase**. A wallet MUST reject uppercase or mixed-case hex in an address rather than normalize it, because accepting mixed case invites the false inference that Movement addresses carry a checksum.
-- Percent-encoding is [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986). Inside any `string` value, and inside `label` and `message`, the characters `&` `=` `#` `%` `,` `[` `]` `(` `)` `+` MUST be percent-encoded. `+` MUST NOT be used to mean a space.
+- Percent-encoding is [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986). Inside `label`, `message`, and `x-` values, the characters `&` `=` `#` `%` `+` MUST be percent-encoded. `+` MUST NOT be used to mean a space.
 - A duplicated parameter key is a rejection, not last-wins or first-wins. Repeated keys carry no positional meaning, so a repeat can only be an error.
 - Query parameter **order is not significant** and carries no meaning.
 
