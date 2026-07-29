@@ -23,13 +23,14 @@ The consequence is that payment acceptance cannot be built once. Every merchant 
 
 ## High-level Overview
 
-A request is a URL: scheme, form prefix, target address, optional chain ID, query parameters.
+A request is a URL: scheme, form prefix, target address, optional chain ID, query parameters. The form prefix states the intent — `pay-` requests a payment to the target address.
 
 ```
 movement:pay-0x9b21…c4f2@126?amount=1250000000&label=Coffee
+movement:pay-0x9b21…c4f2@126?asset=0x52ab…77e1&amount=25000000
 ```
 
-The target is the recipient address. Every parameter is a suggestion the payer may change: the asset (`asset`, defaulting to MOVE), the quantity (`amount`, in the asset's atomic unit), a validity deadline (`expires`), and display strings (`label`, `message`).
+The target is the recipient address. Every parameter is a suggestion the payer may change: the asset (`asset`, an FA metadata object address, defaulting to MOVE), the quantity (`amount`, in the asset's atomic unit), a validity deadline (`expires`), and display strings (`label`, `message`).
 
 The wallet, not the URL, selects the entry function that satisfies the request. A URL stamped on a physical card cannot be revised, and the framework's correct dispatch path changes over time — the coin-to-fungible-asset migration is in progress now — so a URL that named its own call would stop working. [Asset resolution and entry-function selection](#asset-resolution-and-entry-function-selection) specifies the selection rules.
 
@@ -58,7 +59,7 @@ A conforming wallet parses, validates, resolves the asset, selects the entry fun
 
 **Reuse the wallet-standard `signAndSubmitTransaction` surface only, with no URL format.** Movement already has an in-page wallet interface. Rejected because it does not address the problem: the wallet standard requires a live JavaScript context with an already-connected wallet. A QR code on a receipt, an NFC tag in a card, and a link in a chat message have no such context. The two surfaces are complementary; a wallet may also accept a request URL handed to it in-page.
 
-**Allow name-service names in the target position.** Rejected on three counts. There is no framework-level registry on Movement, so a wallet would have to hard-code a third-party resolver address to be interoperable — a centralization decision this MIP should not make by accident. An offline reader (an NFC tap in a poor-signal environment) cannot resolve a name at all, so a name-only request has no offline degradation path. And names invite homograph attacks, which would require a precedence rule and visual-similarity warnings this MIP would then have to specify. Reserving `name` and revisiting once a canonical registry exists costs nothing.
+**Allow name-service names in the target position.** Rejected on three counts. There is no framework-level registry on Movement, so a wallet would have to hard-code a third-party resolver address to be interoperable — a centralization decision this MIP should not make by accident. And names invite homograph attacks, which would require a precedence rule and visual-similarity warnings this MIP would then have to specify. Reserving `name` and revisiting once a canonical registry exists costs nothing.
 
 ## Specification and Implementation Details
 
@@ -71,7 +72,7 @@ The key words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY in this document are t
 3. **Fail closed on anything unrecognized.** An unknown form prefix, an unknown parameter key outside the `x-` extension space, a forbidden key, a malformed value, or a chain ID that does not match the wallet's configured network is a hard rejection with a user-visible reason — never a silently-dropped field. A silently-dropped `amount` is a wrong-amount payment.
 4. **Simulate before you render.** The wallet renders the *simulated* outcome, not the requested one. On Movement, whether a transfer can succeed depends on state the request producer cannot see.
 5. **Human-inspectable on the wire.** A payer looking at the raw URL can read the recipient, the asset, and the amount. No compressed, encoded, or otherwise opaque encoding of those three fields.
-6. **Degrade explicitly when offline.** A wallet with no RPC access can still honor a `pay-` request, with a labeled reduction in the checks it was able to perform. It MUST NOT silently skip a check it advertises.
+6. **Connectivity is required.** Every check in the processing pipeline depends on chain state, and a wallet that cannot submit cannot complete a payment. A wallet without node access MUST reject the request rather than present a reduced-verification confirmation.
 
 ### Syntax
 
@@ -147,7 +148,7 @@ The quantity to transfer, in the **atomic unit** of the asset (octas for MOVE �
 
 The fungible asset to transfer, as its **FA metadata object address** (a `long-address`, or a `special-address` for framework-native assets — MOVE's metadata object is `0xa`).
 
-If absent, the asset is MOVE. Legacy coin **type** strings (`0x1::aptos_coin::AptosCoin`) MUST NOT be used. A coin type requires `<`, `>`, and `::` escaping in a URL, does not exist for FA-native assets, and would push the coin-versus-FA dispatch decision onto the request producer. The metadata object address is the one identity every fungible asset has.
+If absent, the asset is MOVE. The format does not restrict which assets may be requested; the wallet verifies on chain that a fungible asset exists at the address and renders only its on-chain symbol and name. A wallet MAY additionally enforce a curated asset policy — refusing or warning on assets outside a maintained list — as wallet policy; such a list is not part of this format. Legacy coin **type** strings (`0x1::aptos_coin::AptosCoin`) MUST NOT be used. A coin type requires `<`, `>`, and `::` escaping in a URL, does not exist for FA-native assets, and would push the coin-versus-FA dispatch decision onto the request producer. The metadata object address is the one identity every fungible asset has.
 
 #### `expires`
 
@@ -161,9 +162,9 @@ Optional, percent-encoded UTF-8. `label` names the payee ("Coffee Shop"); `messa
 
 #### `decimals`
 
-Optional. A display-only hint for the asset's decimal count, present so that a wallet operating **offline** can render `1250000000` as `12.5` rather than as an unhelpful integer.
+Optional. A producer-stated cross-check on the asset's decimal count.
 
-Normative handling: a wallet that can reach the chain MUST read the authoritative value from the asset's `0x1::fungible_asset::Metadata` and MUST reject the request if `decimals` disagrees with it — a mismatch is either a corrupted request or an attempt to make an amount read as 1000× smaller than it is. A wallet that cannot reach the chain MAY use the hint, and MUST label the rendered amount as unverified.
+The wallet MUST read the authoritative value from the asset's `0x1::fungible_asset::Metadata` and MUST reject the request if `decimals` disagrees with it — a mismatch is either a corrupted request or an attempt to make an amount read as 1000× smaller than it is.
 
 #### Forbidden parameter keys
 
@@ -191,7 +192,7 @@ A fungible asset may have both a legacy `coin` type identity and an FA metadata 
 Therefore:
 
 1. **`aptos_account::transfer_coins<CoinType>` MUST NOT be used.** It withdraws from the FA store, so it fails when the payer's balance is in `CoinStore<C>`, and it adds the `EACCOUNT_DOES_NOT_ACCEPT_DIRECT_COIN_TRANSFERS` abort path.
-2. **A residual legacy balance requires a migration transaction first.** If the payer holds a non-zero `CoinStore<C>`, the wallet MUST land `coin::migrate_to_fungible_store<C>` before the transfer. See [Open Questions](#open-questions) #4.
+2. **A residual legacy balance requires a migration transaction first.** If the payer holds a non-zero `CoinStore<C>`, the wallet MUST land `coin::migrate_to_fungible_store<C>` before the transfer. See [Open Questions](#open-questions) #3.
 
 A residual legacy balance is detected by reading the `0x1::coin::CoinStore<CoinType>` resource at the payer's address, or as `coin::balance<CoinType>(payer)` − `primary_fungible_store::balance(payer, metadata)`. `coin_balance` is an `inline fun` and MUST NOT be relied on; it is not callable. The `CoinType` comes from `coin::paired_coin(metadata)`; `none` means the asset is FA-native and no legacy check applies.
 
@@ -270,7 +271,7 @@ sequenceDiagram
     W-->>P: (optional) out-of-band settlement notification
 ```
 
-**Offline degradation.** A wallet with no node access MAY skip steps 5–12, and in that case MUST: label the amount as unverified when it used the `decimals` hint; state that the recipient could not be checked for the object hazard; and state that the transaction was not simulated and may abort. It MUST NOT proceed offline for any request naming a non-default `asset` — resolving the coin/FA pairing and the payer's balance location is not possible offline, so the entry function cannot be chosen correctly.
+**No offline mode.** A wallet without node access MUST reject the request. Steps 5–12 are chain reads and a wallet that cannot reach a node also cannot submit, so a reduced-verification path would carry every risk of a skipped check without producing a payment. A payer-offline flow — the payer signs and a connected payee propagates the transaction and shows the receipt — requires a return channel from payer to payee and is future work (see [Future Potential](#future-potential)).
 
 #### Insufficient MOVE for fees
 
@@ -291,7 +292,7 @@ Before presenting a confirmation, a wallet MUST read the target's resources and:
 1. **Hard-reject**, with no override, if the target hosts `0x1::fungible_asset::Metadata` or `0x1::fungible_asset::FungibleStore`. These are asset-infrastructure objects — an asset's own identity, and the stores where balances live — and are never valid recipients. A primary store object carries exactly `{FungibleStore, ObjectCore}` and no `Account`.
 2. **Require an explicit typed acknowledgement**, not a dismissible dialog, if `0x1::object::ObjectCore` is present and tier 1 does not apply.
 
-Tier 2 is not a hard rejection because a module holding an `ExtendRef` can produce an object's signer, making object-owned treasuries valid payees. An `ExtendRef` lives in arbitrary module state and is not discoverable, so a wallet cannot distinguish a recoverable treasury object from an unrecoverable store object. See [Open Questions](#open-questions) #6.
+Tier 2 is not a hard rejection because a module holding an `ExtendRef` can produce an object's signer, making object-owned treasuries valid payees. An `ExtendRef` lives in arbitrary module state and is not discoverable, so a wallet cannot distinguish a recoverable treasury object from an unrecoverable store object. See [Open Questions](#open-questions) #5.
 
 The check MUST test for the **presence of `ObjectCore`** and the tier-1 resources, never the *absence* of `0x1::account::Account`. Object addresses acquire an `Account` resource as a side effect of the mistake being guarded against.
 
@@ -371,7 +372,7 @@ Custom URI schemes are unowned: on both mobile platforms any application may dec
 
 **Scheme availability.** `movement` does not appear in the IANA URI scheme registry. Movement SHOULD register it as a provisional scheme per [RFC 7595](https://www.rfc-editor.org/rfc/rfc7595); that does not prevent squatting, but it gives the scheme a citable definition.
 
-Finally, wallets SHOULD NOT build a companion `https://` universal-link form as a substitute: it would place a hostname — and therefore an operator who observes every scan and tap — in the middle of a payment flow, which is a worse privacy and availability posture than an unowned scheme. See [Open Questions](#open-questions) #4.
+Finally, wallets SHOULD NOT build a companion `https://` universal-link form as a substitute: it would place a hostname — and therefore an operator who observes every scan and tap — in the middle of a payment flow, which is a worse privacy and availability posture than an unowned scheme. See [Open Questions](#open-questions) #1.
 
 ## Reference Implementation
 
@@ -419,7 +420,7 @@ Load testing is not applicable: every request terminates at a human confirmation
 | A residual legacy `CoinStore` balance makes a payment fail while `coin::balance` reports funds | Wallet reads the `CoinStore<C>` resource, or subtracts the FA-store balance from `coin::balance`, then inserts a `coin::migrate_to_fungible_store` pre-step. Not solved by `transfer_coins`, which withdraws from the FA store and fails identically |
 | Amount misparsed via scientific notation — a float-based parser silently rounds `18446744073709551615` | Exact-integer requirement, `u64::MAX` bound, rejection rather than saturation. Implementations MUST use exact decimal or big-integer arithmetic |
 | Wrong asset paid — payer holds two assets with the same symbol | `asset` is an FA metadata object address, never a symbol or name. Symbol and name on the confirmation screen come from on-chain metadata only |
-| `decimals` hint used to make an amount read 1000× smaller | Chain value is authoritative; a mismatch is a rejection, not a warning. Offline use of the hint is labeled unverified |
+| `decimals` hint used to make an amount read 1000× smaller | Chain value is authoritative; a mismatch is a rejection, not a warning |
 | Wrong-network payment — 8-bit chain IDs collide across Move networks | Chain ID MUST match the configured network; no network switching to satisfy a request; network rendered by name |
 | Scheme squatting — any app can claim `movement:` | Assumed, not mitigated: the entire security model is the confirmation screen. Rejecting an `https://` universal-link substitute avoids trading this for a hostname dependency |
 | Request replay — the same tag or QR paid twice | `expires` bounds the window and is VM-enforced. Genuine one-shot semantics need `nonce` (reserved) and an authenticated request; out of scope |
@@ -456,7 +457,9 @@ These are enforced by fail-closed parsing (unknown, forbidden, reserved, duplica
 - **Sponsored requests (`fee_payer`).** Movement supports fee-payer transactions natively. A merchant sponsoring gas would let a payer with a zero MOVE balance pay in a stablecoin — the single most common onboarding failure in a card or point-of-sale context. It needs a second signature collected out of band, so the URL can at most name the sponsor and an endpoint; that is a MIP of its own, and one worth writing.
 - **Name resolution (`name`).** Once a Movement name registry exists, a name in the target position becomes worth defining — with a precedence rule and homograph warnings specified explicitly.
 - **One-shot requests (`nonce`).** Genuine anti-replay for invoices, as opposed to the time-bounding that `expires` provides. Needs either an on-chain marker or a payee-side settlement callback, so it is not purely a format change.
-- **Generic entry-function and BCS payload forms (`call-`, `bcs-`).** Reserved prefixes for non-payment requests, if a consumer emerges. Both would need an ABI cross-check and neither can work offline, which is why they are not specified here.
+- **Generic entry-function and BCS payload forms (`call-`, `bcs-`).** Reserved prefixes for non-payment requests, if a consumer emerges. Both would need an ABI cross-check, which is why they are not specified here.
+- **Short asset aliases via an on-chain registry.** A registry mapping compact aliases to FA metadata addresses would let non-MOVE requests fit the smallest NFC tags and give wallets a shared notion of recognized assets. It requires new on-chain infrastructure and governance, so it is a follow-on; long-form addresses remain canonical.
+- **Payer-offline handover.** The payer's wallet signs the transaction offline and transfers it to the connected payee, who propagates it and displays the receipt. Requires a payer→payee return channel (two-way NFC exchange rather than a passive read), so it is a transport extension, not a change to this format.
 - **Confidential payment requests.** MIP-001 defines a `ca_*` wallet interface for confidential assets. A request form that resolves to `ca_transfer` rather than a public transfer is a natural composition and needs no protocol work — the two MIPs already agree that assets are addressed by FA metadata object address, which is what makes them composable at all.
 - **In one year:** a shared parser in the SDK, two or more wallets passing the same conformance suite, and merchant integrations written once against the format rather than once per wallet. **In five years:** the format is the boring substrate under physical payment acceptance on Movement — cards, tags, terminals — and the interesting parts are authentication and sponsorship layered on top of a grammar that did not have to change.
 
@@ -479,9 +482,9 @@ These are enforced by fail-closed parsing (unknown, forbidden, reserved, duplica
 
 ### Suggested deployment timeline
 
-Nothing to deploy on chain — no devnet, testnet, or mainnet activation gate, and no release version to target. Adoption is a wallet and SDK release matter:
+Nothing to deploy on chain — no testnet or mainnet activation gate, and no release version to target. Adoption is a wallet and SDK release matter:
 
-- **Devnet / testnet:** used throughout Phases 2–4 for asset-resolution, expiry, and abort-path matrices.
+- **Testnet:** used throughout Phases 2–4 for asset-resolution, expiry, and abort-path matrices.
 - **Mainnet:** requests against chain ID 126 work the moment a wallet ships support; the `0xa` object-address fixture is a mainnet-state test from Phase 2 onward.
 - **Draft → Last Call:** gated on the Phase 4 cross-implementation result, not on a calendar date. The author will refresh this estimate after the gatekeeper design review, per the template's guidance.
 
@@ -489,10 +492,8 @@ Nothing to deploy on chain — no devnet, testnet, or mainnet activation gate, a
 
 | # | Question | Options | Notes |
 |---|---|---|---|
-| 1 | **Should a wallet ever operate offline?** | (a) Allow degraded offline `pay-` for MOVE, as drafted. (b) Require connectivity for every request. | (b) is simpler and strictly safer — the object-address check and simulation are both unavailable offline. (a) exists because an NFC tap in a poor-signal environment is a real scenario and refusing outright pushes users to a worse workaround. If (a) stands, the labeling requirements need review as a set: an offline confirmation screen carries three separate "not verified" notices, which may be enough to be ignored. |
-| 2 | **Companion `https://` universal-link form?** | (a) No, as drafted. (b) Yes, with a Movement-operated resolver. (c) Yes, producer-hosted. | Weighs unmediated custom-scheme handling against reliable app-store-quality link handling. (b)/(c) put an operator in every scan and tap — a privacy and availability regression — and (a) accepts that scheme squatting is possible. Wallet distribution experience should decide this. |
-| 3 | **Legacy coin-type input for `asset`?** | (a) Reject, as drafted (MIP-001 precedent). (b) Accept and normalize to the FA metadata address for display. | (b) helps producers integrating against not-yet-migrated assets; it also puts `::`, `<`, `>` in URLs and gives producers a way to express a dispatch preference they should not have. Depends on how much unmigrated coin-only supply is expected to persist on Movement. |
-| 4 | **How is a residual legacy `CoinStore` balance handled mid-payment?** | (a) Two confirmations: migrate, then transfer. (b) Migrate without asking, then confirm only the transfer. (c) Migrate opportunistically in the background, outside any payment flow. (d) Have the *payee* or another third party migrate the payer via the permissionless `coin::migrate_coin_store_to_fungible_store<C>(vector<address>)`. | Note what is **not** an option: using `transfer_coins<C>` to spend the legacy balance. It withdraws from the FA store and fails identically — see [Asset resolution](#asset-resolution-and-entry-function-selection). So some migration must happen. (a) is drafted, and is two approvals at exactly the point in a payment flow where users abandon. (b) violates the principle that only what was rendered gets signed. (c) is the best user experience and belongs in the wallet regardless of what this MIP says, but cannot be relied on by a request. (d) is genuinely available because that entry function takes no `&signer`, and is interesting for a merchant who would rather pay the gas than lose the sale — but it means a third party mutating the payer's account, which deserves its own scrutiny. Unresolved, and the highest-value question in this table for anyone building a point-of-sale flow. |
-| 5 | **What should a wallet display when `expires` is absent?** | (a) Nothing. (b) An explicit "no expiry" notice. | Point-of-sale requests without an expiry are the ones most likely to be replayed from a photographed QR code. Cheap to display, and it nudges producers toward setting one. |
-| 6 | **Should tier 2 of the object-address check be a hard rejection instead of a gate?** | (a) Unclickthroughable acknowledgement, as drafted. (b) Hard-reject every `ObjectCore` address. (c) Accept with an ordinary warning. | The asymmetry is stark: wrongly rejecting a legitimate object-owned treasury costs a failed payment, while wrongly accepting a store object costs the funds permanently. That argues for (b). Against it: object-owned treasuries with an `ExtendRef` custodian are legitimate payees, they are not distinguishable from unrecoverable objects by inspection, and (b) makes them unpayable by URL forever. (c) is rejected outright — a dismissible warning in front of irreversible loss is not a control. Whether (a) or (b) should also depend on how common object treasuries actually are on Movement, which is an empirical question worth answering before Last Call. |
-| 7 | **Is a `symbol` display parameter worth adding for offline rendering?** | (a) No, as drafted — symbol comes only from chain metadata. (b) Yes, mirroring `decimals`, verified-when-online. | (b) makes offline rendering of a non-MOVE asset legible. It also creates a spoofable asset name in the URL, and unlike `decimals` a wrong symbol is not detectable by arithmetic. Drafted as (a) partly because the offline path already refuses non-default `asset` for dispatch reasons, which would make the parameter unreachable. |
+| 1 | **Companion `https://` universal-link form?** | (a) No, as drafted. (b) Yes, with a Movement-operated resolver. (c) Yes, producer-hosted. | Weighs unmediated custom-scheme handling against reliable app-store-quality link handling. (b)/(c) put an operator in every scan and tap — a privacy and availability regression — and (a) accepts that scheme squatting is possible. Wallet distribution experience should decide this. |
+| 2 | **Legacy coin-type input for `asset`?** | (a) Reject, as drafted (MIP-001 precedent). (b) Accept and normalize to the FA metadata address for display. | (b) helps producers integrating against not-yet-migrated assets; it also puts `::`, `<`, `>` in URLs and gives producers a way to express a dispatch preference they should not have. Depends on how much unmigrated coin-only supply is expected to persist on Movement. |
+| 3 | **How is a residual legacy `CoinStore` balance handled mid-payment?** | (a) Two confirmations: migrate, then transfer. (b) Migrate without asking, then confirm only the transfer. (c) Migrate opportunistically in the background, outside any payment flow. (d) Have the *payee* or another third party migrate the payer via the permissionless `coin::migrate_coin_store_to_fungible_store<C>(vector<address>)`. | Note what is **not** an option: using `transfer_coins<C>` to spend the legacy balance. It withdraws from the FA store and fails identically — see [Asset resolution](#asset-resolution-and-entry-function-selection). So some migration must happen. (a) is drafted, and is two approvals at exactly the point in a payment flow where users abandon. (b) violates the principle that only what was rendered gets signed. (c) is the best user experience and belongs in the wallet regardless of what this MIP says, but cannot be relied on by a request. (d) is genuinely available because that entry function takes no `&signer`, and is interesting for a merchant who would rather pay the gas than lose the sale — but it means a third party mutating the payer's account, which deserves its own scrutiny. Unresolved, and the highest-value question in this table for anyone building a point-of-sale flow. |
+| 4 | **What should a wallet display when `expires` is absent?** | (a) Nothing. (b) An explicit "no expiry" notice. | Point-of-sale requests without an expiry are the ones most likely to be replayed from a photographed QR code. Cheap to display, and it nudges producers toward setting one. |
+| 5 | **Should tier 2 of the object-address check be a hard rejection instead of a gate?** | (a) Unclickthroughable acknowledgement, as drafted. (b) Hard-reject every `ObjectCore` address. (c) Accept with an ordinary warning. | The asymmetry is stark: wrongly rejecting a legitimate object-owned treasury costs a failed payment, while wrongly accepting a store object costs the funds permanently. That argues for (b). Against it: object-owned treasuries with an `ExtendRef` custodian are legitimate payees, they are not distinguishable from unrecoverable objects by inspection, and (b) makes them unpayable by URL forever. (c) is rejected outright — a dismissible warning in front of irreversible loss is not a control. Whether (a) or (b) should also depend on how common object treasuries actually are on Movement, which is an empirical question worth answering before Last Call. |
