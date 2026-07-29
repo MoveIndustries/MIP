@@ -356,6 +356,15 @@ A request for any asset other than MOVE needs NTAG215 or larger. Producers targe
 
 An NDEF tag is rewritable unless its capability container is locked, and a passive tag can be replaced or overlaid, so a tag is no more trustworthy than any unauthenticated URL. A host-card-emulation reader can present a freshly generated record per tap, bounded by `expires`.
 
+### Reconciliation
+
+No Movement transfer entry function carries a memo or reference field, and no parameter of this format reaches the chain — `label`, `message`, and `x-` keys are display- and producer-local. A producer therefore cannot tag a payment; it can only observe transfers to its address and match them to requests. Two patterns work:
+
+1. **Unique receiving address per request.** The producer derives a fresh address per invoice; any transfer arriving there settles that invoice, exactly. `aptos_account`'s transfer functions create the account on first deposit, so per-invoice addresses need no setup transaction. Costs: address lifecycle management, and funds spread across many accounts until swept (one gas fee per sweep).
+2. **Amount-and-window matching on a single address.** The producer disambiguates by exact atomic amount within the request's `expires` window. Two open requests with the same amount and overlapping windows are ambiguous; producers SHOULD salt the low-order atomic digits per invoice to keep concurrent amounts distinct. Because `expires` is enforced by the VM, a matched payment cannot arrive after its window.
+
+Producers MUST NOT rely on `label`, `message`, or `x-` keys for reconciliation: wallets never transmit them on chain, and this MIP reserves no mechanism that would. A chain-visible reference field would require a framework change and is out of scope.
+
 ### Scheme registration
 
 Custom URI schemes are unowned: on both mobile platforms any application may declare a handler for `movement:`, and the resolution when several do is platform-defined. This MIP therefore does not treat "the wallet opened" as evidence of anything, and the entire security model rests on the confirmation screen.
