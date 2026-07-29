@@ -39,7 +39,7 @@ A conforming wallet parses, validates, resolves the asset, selects the entry fun
 
 **Audiences and required actions:**
 
-- **Wallet implementers (Motion Wallet, third-party Movement wallets).** Register the `movement:` URL scheme with the host OS (Android `intent-filter`, iOS `CFBundleURLTypes`, desktop protocol handler), implement the parser and the [normative processing pipeline](#wallet-processing-pipeline), and satisfy the [confirmation UI requirements](#confirmation-ui-requirements).
+- **Wallet implementers (Motion Wallet, third-party Movement wallets).** Register the `movement:` URL scheme with the host OS where the platform permits (Android `intent-filter`, iOS `CFBundleURLTypes`), implement the parser and the [normative processing pipeline](#wallet-processing-pipeline), and satisfy the [confirmation UI requirements](#confirmation-ui-requirements). Wallet classes that cannot register a scheme handler — browser extensions — consume requests through in-page link interception or paste; the entry point is transport, and conformance is the pipeline and the confirmation requirements.
 - **Request producers (merchant integrations, invoicing tools, point-of-sale software, faucets, dApp "pay" buttons, NFC tag and card personalization tooling).** Emit requests conforming to [Syntax](#syntax), with all hex lowercase and addresses in long form. Include `@<chain_id>` on every request.
 - **SDK maintainers (`@moveindustries/ts-sdk`).** Ship a `buildTransactionRequestUrl` / `parseTransactionRequestUrl` pair and the conformance vectors, so that wallets and producers share one implementation of the grammar rather than five. Details in [Reference Implementation](#reference-implementation).
 - **Asset issuers.** No required action. Note that issuers who register dispatchable withdraw or deposit hooks are choosing to make their asset's transfers abortable for reasons a request producer cannot see; the wallet's simulation step is what keeps that from becoming a confusing failure at signing time.
@@ -301,7 +301,7 @@ Absence of all these resources MUST NOT be treated as an error. Paying a never-b
 
 The confirmation screen — not the URL — is what the payer authorizes. Conforming wallets:
 
-1. Render the **recipient address in full**, 64 hex characters, never elided to `0x9b21…c4f2`. Move has no address checksum, so the middle of an address is exactly where an undetectable substitution hides. Elision MAY be used in list views, never on a confirmation screen.
+1. Render the **recipient address in full**, 64 hex characters, never elided to `0x9b21…c4f2`. Move has no address checksum, so the middle of an address is where an undetectable substitution hides. Elision MAY be used in list views, never on a confirmation screen. The address SHOULD be rendered in fixed-size monospace groups for comparability; a wallet-local contact name or an address-derived visual fingerprint MAY be shown alongside the address, never instead of it.
 2. Render the **amount in nominal units with the symbol**, from on-chain metadata (`12.5 MOVE`), alongside the atomic value. When decimals could not be verified on chain, label the figure as unverified.
 3. Render the **asset's on-chain `symbol` and `name`**, and the metadata address for a non-default asset. Never render a producer-supplied asset name — there is no such parameter, by design.
 4. Render `label` and `message` in a **visually distinct, clearly untrusted** region.
@@ -325,9 +325,15 @@ Encode the URL as-is, in alphanumeric or byte mode. Capacity is not a constraint
 
 Encode as-is. Because a `movement:` link in a web page or message is at least as spoofable as the address it contains, requirement 1 in [Confirmation UI requirements](#confirmation-ui-requirements) is what protects the payer, not anything about the link.
 
+On Android the intent filter MUST declare only the scheme (`<data android:scheme="movement" />`). The request URI is opaque — it has no authority component — and Android applies `android:host` / `android:path` matching only to hierarchical URIs, so a filter that adds either attribute never matches any request and fails silently.
+
+Browser-extension wallets cannot register a scheme handler. A content script MAY intercept activation of `movement:` links and route the URL into the wallet's privileged process; this is a conforming entry point.
+
 #### NFC / NDEF
 
 A request is carried as a single NDEF **URI record** (TNF `0x01`, type `U`). Because `movement:` is not in the NFC Forum URI prefix abbreviation table, the identifier code is `0x00` (no abbreviation) and the whole URL is stored literally.
+
+A device presenting a request dynamically (host-card emulation) MUST emulate an NFC Forum Type 4 tag carrying the same single URI record, so that a reader cannot distinguish a device from a passive tag and no application-specific APDU protocol is required.
 
 Byte counts, driven by the 32-byte (64-character) address:
 
