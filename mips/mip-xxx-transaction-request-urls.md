@@ -34,7 +34,7 @@ The target is the recipient address. Every parameter is a suggestion the payer m
 
 The wallet, not the URL, selects the entry function that satisfies the request. A URL stamped on a physical card cannot be revised, and the framework's correct dispatch path changes over time — the coin-to-fungible-asset migration is in progress now — so a URL that named its own call would stop working. [Asset resolution and entry-function selection](#asset-resolution-and-entry-function-selection) specifies the selection rules.
 
-A conforming wallet parses, validates, resolves the asset, selects the entry function, simulates, and then renders a confirmation screen. The screen, not the URL, is what the user authorizes. Simulation is required because a transfer can abort for reasons the request producer cannot observe: a dispatchable withdraw or deposit hook, a frozen store, or funds still held in an unmigrated legacy store. Two further checks are specified — a long-form-address requirement, since Move addresses carry no checksum, and an object-address check, since a deposit to an object address can be irreversible.
+A conforming wallet parses, validates, resolves the asset, selects the entry function, simulates, and then renders a confirmation screen. The screen, not the URL, is what the user authorizes. Simulation is required because a transfer can abort for reasons the request producer cannot observe: a dispatchable withdraw or deposit hook, a frozen store, or a recipient who has opted out of direct coin transfers. Two further checks are specified — a long-form-address requirement, since Move addresses carry no checksum, and an object-address check, since a deposit to an object address can be irreversible.
 
 ## Impact
 
@@ -183,18 +183,23 @@ Reserved-but-not-yet-defined keys — `sig`, `signer`, `fee_payer`, `name`, `non
 
 Entry-function selection is wallet-side. A request supplies at most an FA metadata address.
 
-A fungible asset may have both a legacy `coin` type identity and an FA metadata object identity, paired through `coin::paired_metadata<CoinType>()` and `coin::paired_coin(metadata)`. `0x1::coin` is a facade over the FA store:
+A fungible asset may have both a legacy `coin` type identity and an FA metadata object identity, paired through `coin::paired_metadata<CoinType>()` and `coin::paired_coin(metadata)`. In the deployed framework the two stores are bridged per operation:
 
-- `coin::withdraw<CoinType>` and `coin::deposit<CoinType>` operate on the **FA store**, not on `CoinStore`.
-- `coin::balance<CoinType>` returns the legacy `CoinStore` balance **plus** the FA store balance, so reading a balance is unified while spending it is not.
-- Migration out of a residual `CoinStore` happens only via `coin::migrate_to_fungible_store<CoinType>(&signer)` or `coin::migrate_coin_store_to_fungible_store<CoinType>(vector<address>)`. No withdraw path migrates implicitly.
+- `coin::withdraw<CoinType>` drains the `CoinStore` balance first, then withdraws any remainder from the FA store; the `frozen` check applies to the `CoinStore` leg. A single withdrawal MAY span both stores.
+- `coin::deposit<CoinType>` deposits into `CoinStore` when the recipient has one, otherwise into the FA store.
+- `coin::balance<CoinType>` returns the `CoinStore` balance plus the FA store balance.
+- `primary_fungible_store::withdraw` reads only the FA store; it has no `CoinStore` fallback.
+- Migration out of a residual `CoinStore` happens only via `coin::migrate_to_fungible_store<CoinType>(&signer)` or the permissionless `coin::migrate_coin_store_to_fungible_store<CoinType>(vector<address>)`. No transfer path migrates implicitly.
 
-Therefore:
+Selection rules:
 
-1. **`aptos_account::transfer_coins<CoinType>` MUST NOT be used.** It withdraws from the FA store, so it fails when the payer's balance is in `CoinStore<C>`, and it adds the `EACCOUNT_DOES_NOT_ACCEPT_DIRECT_COIN_TRANSFERS` abort path.
-2. **A residual legacy balance requires a migration transaction first.** If the payer holds a non-zero `CoinStore<C>`, the wallet MUST land `coin::migrate_to_fungible_store<C>` before the transfer. See [Open Questions](#open-questions) #3.
+1. **MOVE:** `aptos_account::transfer`. Correct under both branches of its feature gate (below).
+2. **Paired asset where the payer holds a residual `CoinStore<C>` balance:** `aptos_account::transfer_coins<C>`. It spans both stores in one transaction. Its costs are a type argument and one extra abort path: `EACCOUNT_DOES_NOT_ACCEPT_DIRECT_COIN_TRANSFERS` when the recipient is unregistered for `C` and has opted out of direct coin transfers (`aptos_account::set_allow_direct_coin_transfers(false)`).
+3. **Every other asset:** `aptos_account::transfer_fungible_assets`. It MUST NOT be selected when rule 2 applies — it has no `CoinStore` fallback and fails on a residual legacy balance that `coin::balance` reports as spendable.
 
-A residual legacy balance is detected by reading the `0x1::coin::CoinStore<CoinType>` resource at the payer's address, or as `coin::balance<CoinType>(payer)` − `primary_fungible_store::balance(payer, metadata)`. `coin_balance` is an `inline fun` and MUST NOT be relied on; it is not callable. The `CoinType` comes from `coin::paired_coin(metadata)`; `none` means the asset is FA-native and no legacy check applies.
+Migration of a residual `CoinStore` is never required inside a payment. A wallet MAY offer `coin::migrate_to_fungible_store<C>` as housekeeping outside the payment flow.
+
+The rule-2 condition is detected by reading the `0x1::coin::CoinStore<CoinType>` resource at the payer's address, or as `coin::balance<CoinType>(payer)` − `primary_fungible_store::balance(payer, metadata)`. `coin_balance` is an `inline fun` and is not callable. The `CoinType` comes from `coin::paired_coin(metadata)`; `none` means the asset is FA-native and rule 3 applies.
 
 ```mermaid
 flowchart TD
@@ -205,35 +210,35 @@ flowchart TD
     D --> E["Read 0x1::fungible_asset::Metadata<br/>at asset address"]
     E -->|missing| X1["REJECT: not a fungible asset"]
     E -->|found| F["decimals, symbol, name<br/>to the confirmation screen"]
-    F --> G{"paired CoinType C exists<br/>AND payer has a residual CoinStore&lt;C&gt;?"}
-    G -->|yes| J["PRE-STEP: coin::migrate_to_fungible_store&lt;C&gt;<br/>separate transaction, separately confirmed"]
-    G -->|no| K
-    J --> K{"asset == 0xa (MOVE)?"}
+    F --> K{"asset == 0xa (MOVE)?"}
     K -->|yes| L["0x1::aptos_account::transfer<br/>to, amount"]
-    K -->|no| M["0x1::aptos_account::transfer_fungible_assets<br/>metadata, to, amount"]
+    K -->|no| G{"paired CoinType C exists<br/>AND payer holds CoinStore&lt;C&gt;?"}
+    G -->|yes| J["0x1::aptos_account::transfer_coins&lt;C&gt;<br/>to, amount — spans both stores"]
+    G -->|no| M["0x1::aptos_account::transfer_fungible_assets<br/>metadata, to, amount"]
     L --> S["Simulate, then confirm"]
+    J --> S
     M --> S
 ```
 
-`aptos_account` is used rather than `primary_fungible_store::transfer` because `transfer_fungible_assets` is non-generic, so the payment case needs no type arguments, and because `aptos_account`'s functions create the recipient's account when it does not exist. A payee may be an address that has never transacted.
+`aptos_account` is used rather than `primary_fungible_store::transfer` because the common case needs no type arguments and because `aptos_account`'s functions create the recipient's account when it does not exist. A payee may be an address that has never transacted.
 
-The two entry functions differ in dispatch. `transfer_fungible_assets` routes through `primary_fungible_store::withdraw` → `dispatchable_fungible_asset::withdraw`, honoring dispatchable hooks and frozen stores. `aptos_account::transfer` calls `fungible_asset::unchecked_withdraw` / `unchecked_deposit`, bypassing the owner, frozen, and dispatchable checks, on the framework's reasoning that MOVE can be neither frozen nor dispatchable. Wallets MUST NOT route any asset other than MOVE through `aptos_account::transfer`.
+The paths differ in dispatch. `transfer_fungible_assets` routes through `primary_fungible_store::withdraw` → `dispatchable_fungible_asset::withdraw`, honoring dispatchable hooks and frozen FA stores. `transfer_coins` routes through `coin::withdraw`/`coin::deposit`, which check `frozen` on the `CoinStore` legs and route any FA remainder through the dispatchable path. `aptos_account::transfer` is gated on the `OPERATIONS_DEFAULT_TO_FA_APT_STORE` feature (flag 65): **disabled — the current state on both Movement networks** — it routes through `coin::transfer<AptosCoin>` with the semantics above; enabled, it calls `fungible_asset::unchecked_withdraw` / `unchecked_deposit`, bypassing the owner, frozen, and dispatchable checks on the framework's reasoning that MOVE can be neither frozen nor dispatchable. Wallets MUST NOT assume either branch: the gate can flip in a framework release, which is why dispatch is wallet-side at payment time rather than fixed in the URL. `aptos_account::transfer` carries only MOVE under both branches.
 
 Framework signatures, verified against Movement mainnet:
 
 | Entry function | Type params | Parameters after `&signer` | Used |
 |---|---|---|---|
-| `0x1::aptos_account::transfer` | 0 | `address`, `u64` | MOVE only |
-| `0x1::aptos_account::transfer_fungible_assets` | 0 | `Object<Metadata>`, `address`, `u64` | Every other FA |
-| `0x1::coin::migrate_to_fungible_store<CoinType>` | 1 | *(none)* | Pre-step only |
-| `0x1::aptos_account::transfer_coins<CoinType>` | 1 | `address`, `u64` | No |
-| `0x1::primary_fungible_store::transfer<T: key>` | 1 | `Object<T>`, `address`, `u64` | No |
+| `0x1::aptos_account::transfer` | 0 | `address`, `u64` | MOVE |
+| `0x1::aptos_account::transfer_coins<CoinType>` | 1 | `address`, `u64` | Paired assets with a residual `CoinStore` |
+| `0x1::aptos_account::transfer_fungible_assets` | 0 | `Object<Metadata>`, `address`, `u64` | Every other asset |
+| `0x1::coin::migrate_to_fungible_store<CoinType>` | 1 | *(none)* | Optional housekeeping, never in-payment |
+| `0x1::primary_fungible_store::transfer<T: key>` | 1 | `Object<T>`, `address`, `u64` | No — generic, no account creation |
 
 A wallet MUST expect and surface these abort paths, none of which a request producer can observe:
 
-- A dispatchable withdraw or deposit hook aborting. Reachable on the `transfer_fungible_assets` path only.
-- A frozen store on either side (`fungible_asset::set_frozen_flag`). Same reachability.
-- Insufficient FA-store balance on a payer whose funds remain in a legacy `CoinStore`.
+- A dispatchable withdraw or deposit hook aborting. Reachable wherever the FA store is touched.
+- A frozen FA store (`fungible_asset::set_frozen_flag`) or a frozen `CoinStore` on either leg of the coin path.
+- `EACCOUNT_DOES_NOT_ACCEPT_DIRECT_COIN_TRANSFERS` on the `transfer_coins` path, when the recipient is unregistered and has opted out.
 
 ### Wallet processing pipeline
 
@@ -285,14 +290,14 @@ Wallets MUST NOT surface that status. Wallets MUST compare the payer's MOVE bala
 
 An object's address occupies the same 32-byte space as an account's and the two are indistinguishable as strings. `aptos_account::transfer` creates an account at any address that lacks one and deposits into its primary store, so a deposit to an object address succeeds. The resulting balance is unspendable: the auto-created `0x1::account::Account` has its `authentication_key` set to the address itself, and finding a key that hashes to a chosen address is computationally infeasible.
 
-On Movement mainnet, `0xa` — the MOVE metadata object, and this MIP's default `asset` — hosts `0x1::object::ObjectCore`, an auto-created `Account` whose `authentication_key` is `0x0…0a`, and a `CoinStore<AptosCoin>` holding 999394914 octas. Those funds are not recoverable.
+On Movement mainnet, `0xa` — the MOVE metadata object, and this MIP's default `asset` — hosts `0x1::object::ObjectCore`, an auto-created `Account` whose `authentication_key` is `0x0…0a`, a `CoinStore<AptosCoin>` holding 999394914 octas, and a second stranded `CoinStore` for a third-party coin type. Those funds are not recoverable.
 
 Before presenting a confirmation, a wallet MUST read the target's resources and:
 
 1. **Hard-reject**, with no override, if the target hosts `0x1::fungible_asset::Metadata` or `0x1::fungible_asset::FungibleStore`. These are asset-infrastructure objects — an asset's own identity, and the stores where balances live — and are never valid recipients. A primary store object carries exactly `{FungibleStore, ObjectCore}` and no `Account`.
 2. **Require an explicit typed acknowledgement**, not a dismissible dialog, if `0x1::object::ObjectCore` is present and tier 1 does not apply.
 
-Tier 2 is not a hard rejection because a module holding an `ExtendRef` can produce an object's signer, making object-owned treasuries valid payees. An `ExtendRef` lives in arbitrary module state and is not discoverable, so a wallet cannot distinguish a recoverable treasury object from an unrecoverable store object. See [Open Questions](#open-questions) #5.
+Tier 2 is not a hard rejection because a module holding an `ExtendRef` can produce an object's signer, making object-owned treasuries valid payees. An `ExtendRef` lives in arbitrary module state and is not discoverable, so a wallet cannot distinguish a recoverable treasury object from an unrecoverable store object. See [Open Questions](#open-questions) #4.
 
 The check MUST test for the **presence of `ObjectCore`** and the tier-1 resources, never the *absence* of `0x1::account::Account`. Object addresses acquire an `Account` resource as a side effect of the mistake being guarded against.
 
@@ -393,10 +398,10 @@ No on-chain code. Three deliverables, all off-chain:
 - **Parser conformance (SDK, CI-gated).** The vector suite run against the SDK parser. Every rejection asserts its specific reason, not merely that it failed.
 - **Property tests (SDK).** `build → parse → build` is a fixed point. Any single-character mutation of a valid request either parses to a different request or fails the grammar; no mutation is silently ignored.
 - **Amount arithmetic (SDK).** Boundary tests around `u64::MAX` and a fuzz pass asserting no input is accepted with a truncated, rounded, saturated, or wrapped value.
-- **Asset resolution (wallet, local node and testnet).** MOVE by default and by explicit `asset=0xa`, asserting the `aptos_account::transfer` path; an FA-native asset and a paired asset with an FA-store balance, both asserting `transfer_fungible_assets`; a paired asset with a residual `CoinStore` balance, asserting a separately-confirmed `coin::migrate_to_fungible_store` pre-step; an asset whose dispatchable hook aborts, asserting the abort surfaces as a failure. Negative: `transfer_coins<C>` MUST NOT appear in any built payload, and `coin::balance` MUST NOT be treated as evidence of spendable funds.
+- **Asset resolution (wallet, local node and testnet).** MOVE by default and by explicit `asset=0xa`, asserting the `aptos_account::transfer` path; an FA-native asset and a paired asset with an FA-store-only balance, both asserting `transfer_fungible_assets`; a paired asset with a residual `CoinStore` balance, asserting `transfer_coins<C>` in a single transaction — including a balance split across both stores; a recipient unregistered for `C` who has opted out of direct coin transfers, asserting the abort surfaces before confirmation; an asset whose dispatchable hook aborts, asserting the same. Negative: `transfer_fungible_assets` MUST NOT be selected when a residual `CoinStore` exists.
 - **Object-address handling (wallet).** `movement:pay-0x000…00a@126?amount=1` is hard-rejected against mainnet state via `Metadata`; a derived primary store address is hard-rejected via `FungibleStore`; a synthetic `ObjectCore`-only object hits the tier-2 gate; a never-used account address is accepted. Negative: an absence-of-`Account` implementation fails this suite.
 - **Zero-gas-balance payer (wallet).** A payer holding no MOVE gets an insufficient-network-fee state and never sees `MAX_GAS_UNITS_BELOW_MIN_TRANSACTION_GAS_UNITS`.
-- **Platform capability (one assertion).** `0x1::features::is_enabled(15)` returns `true` on the configured network. If it does not, every `Object<T>` entry argument breaks.
+- **Platform capability (one test).** Build and simulate a `transfer_fungible_assets` call against the configured network, proving `Object<Metadata>` entry arguments end to end. (The gating flag is `STRUCT_CONSTRUCTORS`, wired through `get_allowed_structs` in the VM's argument validation; the direct test is preferred because it does not depend on a flag number.)
 - **Chain-ID handling (wallet).** `@1`, `@250` on a mainnet wallet, `@256`, `@0126`, and an absent chain ID each produce the specified outcome; no case results in a network switch.
 - **Expiry (wallet, against a node).** A past `expires` is rejected pre-signature. A near-future `expires` produces a transaction whose `expiration_timestamp_secs` does not exceed it, verified by decoding the signed transaction. Submission after expiry is rejected by the VM.
 - **Display-string hardening (wallet).** Snapshot tests over `label` / `message` containing bidirectional overrides, zero-width characters, 10 KB of text, markup, and a nested `movement:` URL, asserting the recipient, asset, amount, and network regions render unchanged.
@@ -417,7 +422,7 @@ Load testing is not applicable: every request terminates at a human confirmation
 |---|---|
 | Address corruption in transit is undetectable — Move addresses carry no checksum, and short forms make many corruptions still-valid addresses | Long-form-only targets; full unelided address on the confirmation screen. Not fully mitigated — see Security Considerations |
 | Funds sent to an object address and permanently lost | Tiered object check: hard rejection for asset-infrastructure objects, acknowledgement gate for other objects. The check tests for `ObjectCore` presence, not `Account` absence. `0xa` in long form serves as a regression fixture |
-| A residual legacy `CoinStore` balance makes a payment fail while `coin::balance` reports funds | Wallet reads the `CoinStore<C>` resource, or subtracts the FA-store balance from `coin::balance`, then inserts a `coin::migrate_to_fungible_store` pre-step. Not solved by `transfer_coins`, which withdraws from the FA store and fails identically |
+| A paired asset routed through `transfer_fungible_assets` fails on a residual `CoinStore` balance that `coin::balance` reports as spendable | Selection rule 2: detect the residual `CoinStore` and route through `transfer_coins<C>`, which spans both stores in one transaction. Simulation catches mis-selection |
 | Amount misparsed via scientific notation — a float-based parser silently rounds `18446744073709551615` | Exact-integer requirement, `u64::MAX` bound, rejection rather than saturation. Implementations MUST use exact decimal or big-integer arithmetic |
 | Wrong asset paid — payer holds two assets with the same symbol | `asset` is an FA metadata object address, never a symbol or name. Symbol and name on the confirmation screen come from on-chain metadata only |
 | `decimals` hint used to make an amount read 1000× smaller | Chain value is authoritative; a mismatch is a rejection, not a warning |
@@ -494,6 +499,5 @@ Nothing to deploy on chain — no testnet or mainnet activation gate, and no rel
 |---|---|---|---|
 | 1 | **Companion `https://` universal-link form?** | (a) No, as drafted. (b) Yes, with a Movement-operated resolver. (c) Yes, producer-hosted. | Weighs unmediated custom-scheme handling against reliable app-store-quality link handling. (b)/(c) put an operator in every scan and tap — a privacy and availability regression — and (a) accepts that scheme squatting is possible. Wallet distribution experience should decide this. |
 | 2 | **Legacy coin-type input for `asset`?** | (a) Reject, as drafted (MIP-001 precedent). (b) Accept and normalize to the FA metadata address for display. | (b) helps producers integrating against not-yet-migrated assets; it also puts `::`, `<`, `>` in URLs and gives producers a way to express a dispatch preference they should not have. Depends on how much unmigrated coin-only supply is expected to persist on Movement. |
-| 3 | **How is a residual legacy `CoinStore` balance handled mid-payment?** | (a) Two confirmations: migrate, then transfer. (b) Migrate without asking, then confirm only the transfer. (c) Migrate opportunistically in the background, outside any payment flow. (d) Have the *payee* or another third party migrate the payer via the permissionless `coin::migrate_coin_store_to_fungible_store<C>(vector<address>)`. | Note what is **not** an option: using `transfer_coins<C>` to spend the legacy balance. It withdraws from the FA store and fails identically — see [Asset resolution](#asset-resolution-and-entry-function-selection). So some migration must happen. (a) is drafted, and is two approvals at exactly the point in a payment flow where users abandon. (b) violates the principle that only what was rendered gets signed. (c) is the best user experience and belongs in the wallet regardless of what this MIP says, but cannot be relied on by a request. (d) is genuinely available because that entry function takes no `&signer`, and is interesting for a merchant who would rather pay the gas than lose the sale — but it means a third party mutating the payer's account, which deserves its own scrutiny. Unresolved, and the highest-value question in this table for anyone building a point-of-sale flow. |
-| 4 | **What should a wallet display when `expires` is absent?** | (a) Nothing. (b) An explicit "no expiry" notice. | Point-of-sale requests without an expiry are the ones most likely to be replayed from a photographed QR code. Cheap to display, and it nudges producers toward setting one. |
-| 5 | **Should tier 2 of the object-address check be a hard rejection instead of a gate?** | (a) Unclickthroughable acknowledgement, as drafted. (b) Hard-reject every `ObjectCore` address. (c) Accept with an ordinary warning. | The asymmetry is stark: wrongly rejecting a legitimate object-owned treasury costs a failed payment, while wrongly accepting a store object costs the funds permanently. That argues for (b). Against it: object-owned treasuries with an `ExtendRef` custodian are legitimate payees, they are not distinguishable from unrecoverable objects by inspection, and (b) makes them unpayable by URL forever. (c) is rejected outright — a dismissible warning in front of irreversible loss is not a control. Whether (a) or (b) should also depend on how common object treasuries actually are on Movement, which is an empirical question worth answering before Last Call. |
+| 3 | **What should a wallet display when `expires` is absent?** | (a) Nothing. (b) An explicit "no expiry" notice. | Point-of-sale requests without an expiry are the ones most likely to be replayed from a photographed QR code. Cheap to display, and it nudges producers toward setting one. |
+| 4 | **Should tier 2 of the object-address check be a hard rejection instead of a gate?** | (a) Unclickthroughable acknowledgement, as drafted. (b) Hard-reject every `ObjectCore` address. (c) Accept with an ordinary warning. | The asymmetry is stark: wrongly rejecting a legitimate object-owned treasury costs a failed payment, while wrongly accepting a store object costs the funds permanently. That argues for (b). Against it: object-owned treasuries with an `ExtendRef` custodian are legitimate payees, they are not distinguishable from unrecoverable objects by inspection, and (b) makes them unpayable by URL forever. (c) is rejected outright — a dismissible warning in front of irreversible loss is not a control. Whether (a) or (b) should also depend on how common object treasuries actually are on Movement, which is an empirical question worth answering before Last Call. |
